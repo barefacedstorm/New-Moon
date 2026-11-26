@@ -1,0 +1,15 @@
+This is the Brotli data compression library from
+https://github.com/google/brotli.
+
+Upstream code can be viewed at
+  https://github.com/google/brotli/tree/master/dec
+
+and cloned by
+  git clone https://github.com/google/brotli
+
+The in-tree copy is updated by running
+  sh update.sh
+from within the modules/brotli directory.
+
+Current version: [commit db24a98aed38a16de78cc05ca15cdd8dc2a0d92d]
+(tagged v1.2.1).

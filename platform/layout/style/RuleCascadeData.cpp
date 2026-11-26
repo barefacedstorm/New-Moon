@@ -1,0 +1,2833 @@
+/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#define PL_ARENA_CONST_ALIGN_MASK 7
+// We want page-sized arenas so there's no fragmentation involved.
+// Including plarena.h must come first to avoid it being included by some
+// header file thereby making PL_ARENA_CONST_ALIGN_MASK ineffective.
+#define NS_WEIGHTEDRULEDATA_ARENA_BLOCK_SIZE (4096)
+#include "plarena.h"
+
+#include "RuleCascadeData.h"
+#include "nsAutoPtr.h"
+#include "nsCSSRuleProcessor.h"
+#include "nsRuleProcessorData.h"
+#include <algorithm>
+#include "nsIAtom.h"
+#include "PLDHashTable.h"
+#include "nsICSSPseudoComparator.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/css/GroupRule.h"
+#include "nsIDocument.h"
+#include "nsPresContext.h"
+#include "nsGkAtoms.h"
+#include "nsUnicharUtils.h"
+#include "nsError.h"
+#include "nsRuleWalker.h"
+#include "nsCSSPseudoClasses.h"
+#include "nsCSSPseudoElements.h"
+#include "nsIContent.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsStyleUtil.h"
+#include "nsQuickSort.h"
+#include "nsAttrValue.h"
+#include "nsAttrValueInlines.h"
+#include "nsAttrName.h"
+#include "nsTArray.h"
+#include "nsIMediaList.h"
+#include "nsContainerCondition.h"
+#include "nsCSSRules.h"
+#include "nsStyleSet.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLSlotElement.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsNthIndexCache.h"
+#include "mozilla/ArrayUtils.h"
+#include "mozilla/EventStates.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Likely.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/TypedEnumBits.h"
+#include "RuleProcessorCache.h"
+#include "nsIDOMMutationEvent.h"
+#include "nsIMozBrowserFrame.h"
+#include "nsCSSRuleUtils.h"
+#include "nsMediaFeatures.h"
+#include "nsIFrame.h"
+#include "nsComputedDOMStyle.h"
+#include "nsStyleConsts.h"
+#include "nsCSSParser.h"
+#include "mozilla/CSSVariableValues.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+// ------------------------------
+// Rule hash table
+//
+
+// Uses any of the sets of ops below.
+struct RuleHashTableEntry : public PLDHashEntryHdr
+{
+  // If you add members that have heap allocated memory be sure to change the
+  // logic in SizeOfRuleHashTable().
+  // Auto length 1, because we always have at least one entry in mRules.
+  AutoTArray<RuleValue, 1> mRules;
+};
+
+struct RuleHashTagTableEntry : public RuleHashTableEntry
+{
+  // If you add members that have heap allocated memory be sure to change the
+  // logic in RuleHash::SizeOf{In,Ex}cludingThis.
+  nsCOMPtr<nsIAtom> mTag;
+};
+
+static PLDHashNumber
+RuleHash_CIHashKey(const void* key)
+{
+  nsIAtom* atom = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+
+  nsAutoString str;
+  atom->ToString(str);
+  nsContentUtils::ASCIIToLower(str);
+  return HashString(str);
+}
+
+static inline nsCSSSelector*
+SubjectSelectorForRuleHash(const PLDHashEntryHdr* hdr)
+{
+  auto entry = static_cast<const RuleHashTableEntry*>(hdr);
+  nsCSSSelector* selector = entry->mRules[0].mSelector;
+  if (selector->IsPseudoElement()) {
+    selector = selector->mNext;
+  }
+  return selector;
+}
+
+static inline bool
+CIMatchAtoms(const void* key, nsIAtom* entry_atom)
+{
+  auto match_atom = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+
+  // Check for case-sensitive match first.
+  if (match_atom == entry_atom) {
+    return true;
+  }
+
+  // Use EqualsIgnoreASCIICase instead of full on unicode case conversion
+  // in order to save on performance. This is only used in quirks mode
+  // anyway.
+  return nsContentUtils::EqualsIgnoreASCIICase(
+    nsDependentAtomString(entry_atom), nsDependentAtomString(match_atom));
+}
+
+static inline bool
+CSMatchAtoms(const void* key, nsIAtom* entry_atom)
+{
+  auto match_atom = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+  return match_atom == entry_atom;
+}
+
+static bool
+RuleHash_ClassCIMatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  return CIMatchAtoms(key, SubjectSelectorForRuleHash(hdr)->mClassList->mAtom);
+}
+
+static bool
+RuleHash_IdCIMatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  return CIMatchAtoms(key, SubjectSelectorForRuleHash(hdr)->mIDList->mAtom);
+}
+
+static bool
+RuleHash_ClassCSMatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  return CSMatchAtoms(key, SubjectSelectorForRuleHash(hdr)->mClassList->mAtom);
+}
+
+static bool
+RuleHash_IdCSMatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  return CSMatchAtoms(key, SubjectSelectorForRuleHash(hdr)->mIDList->mAtom);
+}
+
+static void
+RuleHash_InitEntry(PLDHashEntryHdr* hdr, const void* key)
+{
+  RuleHashTableEntry* entry = static_cast<RuleHashTableEntry*>(hdr);
+  new (KnownNotNull, entry) RuleHashTableEntry();
+}
+
+static void
+RuleHash_ClearEntry(PLDHashTable* table, PLDHashEntryHdr* hdr)
+{
+  RuleHashTableEntry* entry = static_cast<RuleHashTableEntry*>(hdr);
+  entry->~RuleHashTableEntry();
+}
+
+static void
+RuleHash_MoveEntry(PLDHashTable* table,
+                   const PLDHashEntryHdr* from,
+                   PLDHashEntryHdr* to)
+{
+  NS_PRECONDITION(from != to, "This is not going to work!");
+  RuleHashTableEntry* oldEntry = const_cast<RuleHashTableEntry*>(
+    static_cast<const RuleHashTableEntry*>(from));
+  auto* newEntry = new (KnownNotNull, to) RuleHashTableEntry();
+  newEntry->mRules.SwapElements(oldEntry->mRules);
+  oldEntry->~RuleHashTableEntry();
+}
+
+static bool
+RuleHash_TagTable_MatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  nsIAtom* match_atom = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+  nsIAtom* entry_atom = static_cast<const RuleHashTagTableEntry*>(hdr)->mTag;
+
+  return match_atom == entry_atom;
+}
+
+static void
+RuleHash_TagTable_InitEntry(PLDHashEntryHdr* hdr, const void* key)
+{
+  RuleHashTagTableEntry* entry = static_cast<RuleHashTagTableEntry*>(hdr);
+  new (KnownNotNull, entry) RuleHashTagTableEntry();
+  entry->mTag = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+}
+
+static void
+RuleHash_TagTable_ClearEntry(PLDHashTable* table, PLDHashEntryHdr* hdr)
+{
+  RuleHashTagTableEntry* entry = static_cast<RuleHashTagTableEntry*>(hdr);
+  entry->~RuleHashTagTableEntry();
+}
+
+static void
+RuleHash_TagTable_MoveEntry(PLDHashTable* table,
+                            const PLDHashEntryHdr* from,
+                            PLDHashEntryHdr* to)
+{
+  NS_PRECONDITION(from != to, "This is not going to work!");
+  RuleHashTagTableEntry* oldEntry = const_cast<RuleHashTagTableEntry*>(
+    static_cast<const RuleHashTagTableEntry*>(from));
+  auto* newEntry = new (KnownNotNull, to) RuleHashTagTableEntry();
+  newEntry->mTag.swap(oldEntry->mTag);
+  newEntry->mRules.SwapElements(oldEntry->mRules);
+  oldEntry->~RuleHashTagTableEntry();
+}
+
+static PLDHashNumber
+RuleHash_NameSpaceTable_HashKey(const void* key)
+{
+  return NS_PTR_TO_INT32(key);
+}
+
+static bool
+RuleHash_NameSpaceTable_MatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  const RuleHashTableEntry* entry = static_cast<const RuleHashTableEntry*>(hdr);
+
+  nsCSSSelector* selector = entry->mRules[0].mSelector;
+  if (selector->IsPseudoElement()) {
+    selector = selector->mNext;
+  }
+  return NS_PTR_TO_INT32(key) == selector->mNameSpace;
+}
+
+/* static */ const PLDHashTableOps RuleHash::TagTable_Ops = {
+  PLDHashTable::HashVoidPtrKeyStub,
+  RuleHash_TagTable_MatchEntry,
+  RuleHash_TagTable_MoveEntry,
+  RuleHash_TagTable_ClearEntry,
+  RuleHash_TagTable_InitEntry
+};
+
+// Case-sensitive ops.
+/* static */ const PLDHashTableOps RuleHash::ClassTable_CSOps = {
+  PLDHashTable::HashVoidPtrKeyStub,
+  RuleHash_ClassCSMatchEntry,
+  RuleHash_MoveEntry,
+  RuleHash_ClearEntry,
+  RuleHash_InitEntry
+};
+
+// Case-insensitive ops.
+/* static */ const PLDHashTableOps RuleHash::ClassTable_CIOps = {
+  RuleHash_CIHashKey,
+  RuleHash_ClassCIMatchEntry,
+  RuleHash_MoveEntry,
+  RuleHash_ClearEntry,
+  RuleHash_InitEntry
+};
+
+// Case-sensitive ops.
+/* static */ const PLDHashTableOps RuleHash::IdTable_CSOps = {
+  PLDHashTable::HashVoidPtrKeyStub,
+  RuleHash_IdCSMatchEntry,
+  RuleHash_MoveEntry,
+  RuleHash_ClearEntry,
+  RuleHash_InitEntry
+};
+
+// Case-insensitive ops.
+/* static */ const PLDHashTableOps RuleHash::IdTable_CIOps = {
+  RuleHash_CIHashKey,
+  RuleHash_IdCIMatchEntry,
+  RuleHash_MoveEntry,
+  RuleHash_ClearEntry,
+  RuleHash_InitEntry
+};
+
+/* static */ const PLDHashTableOps RuleHash::NameSpaceTable_Ops = {
+  RuleHash_NameSpaceTable_HashKey,
+  RuleHash_NameSpaceTable_MatchEntry,
+  RuleHash_MoveEntry,
+  RuleHash_ClearEntry,
+  RuleHash_InitEntry
+};
+
+#undef RULE_HASH_STATS
+#undef PRINT_UNIVERSAL_RULES
+
+#ifdef RULE_HASH_STATS
+#define RULE_HASH_STAT_INCREMENT(var_)                                         \
+  PR_BEGIN_MACRO++(var_);                                                      \
+  PR_END_MACRO
+#else
+#define RULE_HASH_STAT_INCREMENT(var_) PR_BEGIN_MACRO PR_END_MACRO
+#endif
+
+RuleHash::RuleHash(bool aQuirksMode)
+  : mRuleCount(0)
+  , mIdTable(aQuirksMode ? &RuleHash::IdTable_CIOps : &RuleHash::IdTable_CSOps,
+             sizeof(RuleHashTableEntry))
+  , mClassTable(aQuirksMode ? &RuleHash::ClassTable_CIOps
+                            : &RuleHash::ClassTable_CSOps,
+                sizeof(RuleHashTableEntry))
+  , mTagTable(&RuleHash::TagTable_Ops, sizeof(RuleHashTagTableEntry))
+  , mNameSpaceTable(&RuleHash::NameSpaceTable_Ops, sizeof(RuleHashTableEntry))
+  , mUniversalRules(0)
+  , mEnumList(nullptr)
+  , mEnumListSize(0)
+  , mEnumListDepth(0)
+  , mQuirksMode(aQuirksMode)
+#ifdef RULE_HASH_STATS
+  , mUniversalSelectors(0)
+  , mNameSpaceSelectors(0)
+  , mTagSelectors(0)
+  , mClassSelectors(0)
+  , mIdSelectors(0)
+  , mElementsMatched(0)
+  , mElementUniversalCalls(0)
+  , mElementNameSpaceCalls(0)
+  , mElementTagCalls(0)
+  , mElementClassCalls(0)
+  , mElementIdCalls(0)
+#endif
+{
+  MOZ_COUNT_CTOR(RuleHash);
+}
+
+RuleHash::~RuleHash()
+{
+  MOZ_COUNT_DTOR(RuleHash);
+#ifdef RULE_HASH_STATS
+  printf("RuleHash(%p):\n"
+         "  Selectors: Universal (%u) NameSpace(%u) Tag(%u) Class(%u) Id(%u)\n"
+         "  Content Nodes: Elements(%u)\n"
+         "  Element Calls: Universal(%u) NameSpace(%u) Tag(%u) Class(%u) "
+         "Id(%u)\n" static_cast<void*>(this),
+         mUniversalSelectors,
+         mNameSpaceSelectors,
+         mTagSelectors,
+         mClassSelectors,
+         mIdSelectors,
+         mElementsMatched,
+         mElementUniversalCalls,
+         mElementNameSpaceCalls,
+         mElementTagCalls,
+         mElementClassCalls,
+         mElementIdCalls);
+#ifdef PRINT_UNIVERSAL_RULES
+  {
+    if (mUniversalRules.Length() > 0) {
+      printf("  Universal rules:\n");
+      for (uint32_t i = 0; i < mUniversalRules.Length(); ++i) {
+        RuleValue* value = &(mUniversalRules[i]);
+        nsAutoString selectorText;
+        uint32_t lineNumber = value->mRule->GetLineNumber();
+        RefPtr<CSSStyleSheet> cssSheet = value->mRule->GetStyleSheet();
+        value->mSelector->ToString(selectorText, cssSheet);
+
+        printf("    line %d, %s\n",
+               lineNumber,
+               NS_ConvertUTF16toUTF8(selectorText).get());
+      }
+    }
+  }
+#endif // PRINT_UNIVERSAL_RULES
+#endif // RULE_HASH_STATS
+  // Rule Values are arena allocated no need to delete them. Their destructor
+  // isn't doing any cleanup. So we dont even bother to enumerate through
+  // the hash tables and call their destructors.
+  if (nullptr != mEnumList) {
+    delete[] mEnumList;
+  }
+}
+
+void
+RuleHash::AppendRuleToTable(PLDHashTable* aTable,
+                            const void* aKey,
+                            const RuleSelectorPair& aRuleInfo)
+{
+  // Get a new or existing entry.
+  auto entry = static_cast<RuleHashTableEntry*>(aTable->Add(aKey, fallible));
+  if (!entry)
+    return;
+  entry->mRules.AppendElement(RuleValue(aRuleInfo, mRuleCount++, mQuirksMode));
+}
+
+/* static */ void
+RuleHash::AppendRuleToTagTable(PLDHashTable* aTable,
+                               nsIAtom* aKey,
+                               const RuleValue& aRuleInfo)
+{
+  // Get a new or exisiting entry
+  auto entry = static_cast<RuleHashTagTableEntry*>(aTable->Add(aKey, fallible));
+  if (!entry)
+    return;
+
+  entry->mRules.AppendElement(aRuleInfo);
+}
+
+void
+RuleHash::AppendUniversalRule(const RuleSelectorPair& aRuleInfo)
+{
+  mUniversalRules.AppendElement(
+    RuleValue(aRuleInfo, mRuleCount++, mQuirksMode));
+}
+
+static bool
+SelectorContainsPseudoClass(nsCSSSelector* aSelector, CSSPseudoClassType aType)
+{
+  for (nsCSSSelector* selector = aSelector; selector; selector = selector->mNext) {
+    for (nsPseudoClassList* pseudoClass = selector->mPseudoClassList;
+         pseudoClass;
+         pseudoClass = pseudoClass->mNext) {
+      if (pseudoClass->mType == aType) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+void
+RuleHash::AppendRule(const RuleSelectorPair& aRuleInfo)
+{
+  nsCSSSelector* selector = aRuleInfo.mSelector;
+  if (selector->IsPseudoElement()) {
+    selector = selector->mNext;
+  }
+  if (SelectorContainsPseudoClass(selector, CSSPseudoClassType::part)) {
+    AppendUniversalRule(aRuleInfo);
+    RULE_HASH_STAT_INCREMENT(mUniversalSelectors);
+  } else if (nullptr != selector->mIDList) {
+    AppendRuleToTable(&mIdTable, selector->mIDList->mAtom, aRuleInfo);
+    RULE_HASH_STAT_INCREMENT(mIdSelectors);
+  } else if (nullptr != selector->mClassList) {
+    AppendRuleToTable(&mClassTable, selector->mClassList->mAtom, aRuleInfo);
+    RULE_HASH_STAT_INCREMENT(mClassSelectors);
+  } else if (selector->mLowercaseTag) {
+    RuleValue ruleValue(aRuleInfo, mRuleCount++, mQuirksMode);
+    AppendRuleToTagTable(&mTagTable, selector->mLowercaseTag, ruleValue);
+    RULE_HASH_STAT_INCREMENT(mTagSelectors);
+    if (selector->mCasedTag && selector->mCasedTag != selector->mLowercaseTag) {
+      AppendRuleToTagTable(&mTagTable, selector->mCasedTag, ruleValue);
+      RULE_HASH_STAT_INCREMENT(mTagSelectors);
+    }
+  } else if (kNameSpaceID_Unknown != selector->mNameSpace) {
+    AppendRuleToTable(
+      &mNameSpaceTable, NS_INT32_TO_PTR(selector->mNameSpace), aRuleInfo);
+    RULE_HASH_STAT_INCREMENT(mNameSpaceSelectors);
+  } else { // universal tag selector
+    AppendUniversalRule(aRuleInfo);
+    RULE_HASH_STAT_INCREMENT(mUniversalSelectors);
+  }
+}
+
+// this should cover practically all cases so we don't need to reallocate
+#define MIN_ENUM_LIST_SIZE 8
+
+#ifdef RULE_HASH_STATS
+#define RULE_HASH_STAT_INCREMENT_LIST_COUNT(list_, var_)                       \
+  (var_) += (list_).Length()
+#else
+#define RULE_HASH_STAT_INCREMENT_LIST_COUNT(list_, var_)                       \
+  PR_BEGIN_MACRO PR_END_MACRO
+#endif
+
+static inline bool
+LookForTargetPseudo(nsCSSSelector* aSelector,
+                    TreeMatchContext* aMatchContext,
+                    nsRestyleHint* possibleChange)
+{
+  if (aMatchContext->mOnlyMatchHostPseudo) {
+    if (SelectorContainsPseudoClass(aSelector, CSSPseudoClassType::part)) {
+      return true;
+    }
+
+    while (aSelector && aSelector->mNext != nullptr) {
+      aSelector = aSelector->mNext;
+    }
+
+    for (nsPseudoClassList* pseudoClass = aSelector->mPseudoClassList;
+         pseudoClass;
+         pseudoClass = pseudoClass->mNext) {
+      if (pseudoClass->mType == CSSPseudoClassType::host ||
+          pseudoClass->mType == CSSPseudoClassType::hostContext) {
+        if (possibleChange) {
+          // :host-context will walk ancestors looking for a match of a
+          // compound selector, thus any changes to ancestors may require
+          // restyling the subtree.
+          *possibleChange |= eRestyle_Subtree;
+        }
+        return true;
+      }
+    }
+    return false;
+  } else if (aMatchContext->mRestrictToSlottedPseudo) {
+    for (nsCSSSelector* selector = aSelector; selector;
+         selector = selector->mNext) {
+      if (!selector->mPseudoClassList) {
+        continue;
+      }
+      for (nsPseudoClassList* pseudoClass = selector->mPseudoClassList;
+           pseudoClass;
+           pseudoClass = pseudoClass->mNext) {
+        if (pseudoClass->mType == CSSPseudoClassType::slotted) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  // We're not restricted to a specific pseudo-class.
+  return true;
+}
+
+// The basis a percentage resolves against.  The real containing block is a
+// layout notion that may not exist yet; the parent's specified size is the
+// closest stand-in available before layout, and a percentage against an unknown
+// basis is worth less than the rect fallback, so an unknown axis stays zero.
+static nsSize
+ContainingBlockBasis(nsStyleContext* aParent)
+{
+  nsSize basis(0, 0);
+  if (!aParent) {
+    return basis;
+  }
+  const nsStylePosition* pos = aParent->StylePosition();
+  if (pos->mWidth.ConvertsToLength()) {
+    basis.width = pos->mWidth.GetCoordValue();
+  }
+  if (pos->mHeight.ConvertsToLength()) {
+    basis.height = pos->mHeight.GetCoordValue();
+  }
+  return basis;
+}
+
+// The extent a container query on one axis is answered from.  Containment makes
+// the box's own specified size authoritative on the contained axes, so it wins
+// over the content rect.  The rect is only the fallback -- and on a box that has
+// not been reflowed it is also the only wrong answer, which matters because
+// style resolution runs ahead of reflow.
+//
+// The inline axis is contained for every container type; the block axis only
+// for `size`.  The extents returned are content-box CSS pixels, matching what
+// the rect fallback measures, so a border-box specified size is reduced by its
+// padding and border first.
+static float
+QueryableExtent(nsStyleContext* aSC, const nsSize& aRect,
+                const nsSize& aContainingBlock, bool aIsWidth, bool aVertical,
+                bool aBlockQueryable)
+{
+  const bool inlineAxis = aIsWidth != aVertical;
+  const float rectExtent = nsPresContext::AppUnitsToFloatCSSPixels(
+                           aIsWidth ? aRect.width : aRect.height);
+
+  // An `inline-size` container cannot answer for the block axis at all, so the
+  // rect is all there is -- stale as it may be on a box that has not reflowed.
+  if (!inlineAxis && !aBlockQueryable) {
+    return rectExtent;
+  }
+
+  const nsStylePosition* pos = aSC->StylePosition();
+  const nsStyleCoord& coord = aIsWidth ? pos->mWidth : pos->mHeight;
+
+  float extent;
+  if (coord.ConvertsToLength()) {
+    extent = nsPresContext::AppUnitsToFloatCSSPixels(coord.GetCoordValue());
+  } else if (coord.GetUnit() == eStyleUnit_Percent) {
+    // A percentage is definite against its containing block even though it is
+    // not a length.  Without a basis there is nothing better than the rect.
+    const nscoord basis = aIsWidth ? aContainingBlock.width
+                                   : aContainingBlock.height;
+    if (basis <= 0) {
+      return rectExtent;
+    }
+    extent = nsPresContext::AppUnitsToFloatCSSPixels(basis) *
+             coord.GetPercentValue();
+  } else {
+    // auto and the rest: the used size depends on layout we have not run.
+    return rectExtent;
+  }
+
+  if (pos->mBoxSizing == mozilla::StyleBoxSizing::Border) {
+    // The specified size measures the border box under border-box sizing; the
+    // query measures the content box.
+    const Side start = aIsWidth ? eSideLeft : eSideTop;
+    const Side end = aIsWidth ? eSideRight : eSideBottom;
+    nscoord inset = aSC->StyleBorder()->GetComputedBorderWidth(start) +
+                    aSC->StyleBorder()->GetComputedBorderWidth(end);
+    nsMargin padding;
+    if (aSC->StylePadding()->GetPadding(padding)) {
+      inset += padding.Side(start) + padding.Side(end);
+    }
+    extent -= nsPresContext::AppUnitsToFloatCSSPixels(inset);
+  }
+
+  return std::max(extent, 0.0f);
+}
+
+struct ContainerSize {
+  // Physical extents. Always real: cq units resolve against them whether or
+  // not the axis is queryable.
+  float mWidth = 0.0f;
+  float mHeight = 0.0f;
+  // Reference extents for container query length units.  A unit in a condition
+  // is resolved as if it were specified on the query container, so it measures
+  // an *ancestor* of it and never the container itself; the small viewport is
+  // the fallback when no ancestor is eligible on the unit's axis.
+  float mUnitInline = 0.0f;
+  float mUnitBlock = 0.0f;
+  // Computed font-size of the container. Relative units in a condition are
+  // evaluated against the container, not against the initial font as they are
+  // in a media query.
+  nscoord mFontSize = 0;
+  // Computed font-size of the root element.  `rem` is the one relative unit
+  // that does not follow the container.
+  nscoord mRootFontSize = 0;
+  // The container's inline axis runs vertically, so inline-size is its height
+  // and block-size is its width.
+  bool mVertical = false;
+  // Only `container-type: size` lets a feature look at the block axis.
+  bool mBlockQueryable = false;
+};
+
+// Nearest ancestor container, honouring the query name if it has one.
+// Record that aElement's style depends on aContainer, so a change to the
+// container restyles it rather than the whole subtree.  The same element is
+// appended once per rule that resolves against the container, so dedupe; the
+// lists are the width of a container's conditional descendants, not of its
+// subtree.
+static void
+AddContainerDependent(nsIFrame* aContainerFrame, Element* aElement,
+                      nsPresContext* aPresContext)
+{
+  auto* dependents = static_cast<ContainerQueryDependents*>(
+      aContainerFrame->GetProperty(nsIFrame::ContainerQueryDependentsProperty()));
+  const uint32_t generation = aPresContext->ContainerQueryGeneration();
+  if (!dependents) {
+    dependents = new ContainerQueryDependents();
+    aContainerFrame->SetProperty(nsIFrame::ContainerQueryDependentsProperty(),
+                                 dependents);
+    dependents->mGeneration = generation;
+  } else if (dependents->mGeneration != generation) {
+    // First evaluation on this container in a new pass: rebuild from scratch
+    // so elements that stopped depending on us fall out.
+    dependents->mElements.Clear();
+    dependents->mGeneration = generation;
+  }
+  if (!dependents->mElements.Contains(aElement)) {
+    dependents->mElements.AppendElement(aElement);
+  }
+}
+
+// Nearest ancestor container, honouring the query name if it has one.
+// The root element's font-size, for resolving a rem in a condition.  A rem is
+// defined against the root and not against the container, so the walk goes to
+// the top of the context chain rather than stopping at the container.  The
+// chain is already resolved here, so this costs nothing and never re-enters
+// style resolution.
+static nscoord
+RootFontSizeFor(nsPresContext* aPresContext)
+{
+  // Not the container's style context chain.  If the container's own style did
+  // not change, ResolveStyleFor reuses the old context and its parent chain
+  // still leads to the previous root context, so the root font sticks at
+  // whatever it was when the chain was built.
+  if (Element* root = aPresContext->Document()->GetRootElement()) {
+    if (nsIFrame* rootFrame = root->GetPrimaryFrame()) {
+      return rootFrame->StyleFont()->mFont.size;
+    }
+  }
+  // No root frame yet (detached, or before frame construction).
+  return aPresContext->GetDefaultFont(kPresContext_DefaultVariableFont_ID,
+                                      nullptr)->size;
+}
+
+static bool
+FindQueryContainer(Element* aElement, const nsAString& aName,
+                   ContainerSize& aSize, nsPresContext* aPresContext,
+                   bool aBlockAxis, bool aUsesRootEM, Element** aContainer)
+{
+  for (Element* e = aElement->GetParentElement(); e;
+       e = e->GetParentElement()) {
+    nsIFrame* frame = e->GetPrimaryFrame();
+    if (!frame) {
+      continue;
+    }
+    const nsStyleDisplay* display = frame->StyleDisplay();
+    if (!display->IsContainerForSizeQueries()) {
+      continue;
+    }
+    if (!aName.IsEmpty() && !display->HasContainerName(aName)) {
+      continue;
+    }
+
+    // Only the inline axis is queryable unless the container is `size`.
+    const bool vertical = frame->GetWritingMode().IsVertical();
+    const bool blockQueryable =
+      display->mContainerType == NS_STYLE_CONTAINER_TYPE_SIZE;
+
+    if (aBlockAxis && !blockQueryable) {
+      // The unit measures the block axis, which this container cannot answer
+      // for; keep walking outwards.
+      continue;
+    }
+
+    aSize.mVertical = vertical;
+    aSize.mBlockQueryable = blockQueryable;
+    aSize.mFontSize = frame->StyleFont()->mFont.size;
+    // Size containment makes the box's own specified size authoritative, so
+    // take it wherever it is available; the rect is only the fallback.
+    nsStyleContext* sc = frame->StyleContext();
+    // rem is the root's, and the container is normally not the root, so this
+    // is a separate walk from the one that found the container.
+    if (aUsesRootEM) {
+      aSize.mRootFontSize = RootFontSizeFor(aPresContext);
+    }
+    nsSize rect = frame->GetContentRectRelativeToSelf().Size();
+    const nsSize basis = ContainingBlockBasis(sc->GetParent());
+    aSize.mWidth = QueryableExtent(sc, rect, basis, true, vertical, blockQueryable);
+    aSize.mHeight = QueryableExtent(sc, rect, basis, false, vertical, blockQueryable);
+
+    AddContainerDependent(frame, aElement, aPresContext);
+    if (aContainer) {
+      *aContainer = e;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+// Nearest ancestor style container, honouring the query name.  `container-type:
+// normal` is a style container, so this walk is separate from
+// FindQueryContainer, which needs size containment.
+static bool
+FindStyleContainer(Element* aElement, const nsAString& aName,
+                   nsPresContext* aPresContext, Element** aContainer)
+{
+  for (Element* e = aElement->GetParentElement(); e;
+       e = e->GetParentElement()) {
+    nsIFrame* frame = e->GetPrimaryFrame();
+    if (!frame) {
+      continue;
+    }
+    const nsStyleDisplay* display = frame->StyleDisplay();
+    if (!display->IsContainerForStyleQueries()) {
+      continue;
+    }
+    if (!aName.IsEmpty() && !display->HasContainerName(aName)) {
+      continue;
+    }
+    AddContainerDependent(frame, aElement, aPresContext);
+    *aContainer = e;
+    return true;
+  }
+  return false;
+}
+
+// Collapse whitespace runs and trim.  Both sides were flattened by their own
+// capture, so spacing between tokens carries no meaning and only content does.
+static void
+NormaliseTokenStream(const nsAString& aIn, nsAString& aOut)
+{
+  aOut.Truncate();
+  bool pendingSpace = false;
+  for (uint32_t i = 0; i < aIn.Length(); ++i) {
+    const char16_t c = aIn[i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+      pendingSpace = !aOut.IsEmpty();
+      continue;
+    }
+    if (pendingSpace) {
+      aOut.Append(' ');
+      pendingSpace = false;
+    }
+    aOut.Append(c);
+  }
+}
+
+// Whether the value text contains a var() reference.  Function names are ASCII
+// case-insensitive, so "VAR(" counts too.
+static bool
+HasVarReference(const nsAString& aText)
+{
+  const uint32_t length = aText.Length();
+  for (uint32_t i = 0; i + 4 <= length; ++i) {
+    if ((aText[i] == 'v' || aText[i] == 'V') &&
+        (aText[i + 1] == 'a' || aText[i + 1] == 'A') &&
+        (aText[i + 2] == 'r' || aText[i + 2] == 'R') &&
+        aText[i + 3] == '(') {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Substitute var() in the query value.  The computed side is already
+// substituted, so the query side has to be too for the two to compare.
+static bool
+ResolveStyleQueryText(const nsAString& aText, const CSSVariableValues* aVars,
+                      nsAString& aOut)
+{
+  if (!HasVarReference(aText)) {
+    aOut = aText;
+    return true;
+  }
+  nsCSSParser parser;
+  nsString result;
+  nsCSSTokenSerializationType first, last;
+  if (!parser.ResolveVariableValue(aText, aVars, result, first, last)) {
+    return false;
+  }
+  aOut = result;
+  return true;
+}
+
+// Compare two already normalised style values.  Without an operator this is
+// plain equality.  Ordering needs both sides to be a number with the same
+// unit; anything else is not comparable and stays unknown.
+static ContainerEval
+CompareStyleValues(const nsAString& aActual, const nsAString& aWanted,
+                   ContainerStyleQuery::StyleQueryOperator aOperator)
+{
+  if (aOperator == ContainerStyleQuery::eNone ||
+      aOperator == ContainerStyleQuery::eEquals) {
+    return aActual.Equals(aWanted) ? ContainerEval::True
+                                   : ContainerEval::False;
+  }
+
+  auto split = [](const nsAString& aValue, float& aNumber, nsAutoString& aUnit) {
+    const char16_t* chars = aValue.BeginReading();
+    const uint32_t length = aValue.Length();
+    uint32_t i = 0;
+    while (i < length && chars[i] == ' ') {
+      ++i;
+    }
+    const uint32_t start = i;
+    if (i < length && (chars[i] == '-' || chars[i] == '+')) {
+      ++i;
+    }
+    bool haveDigits = false;
+    while (i < length && ((chars[i] >= '0' && chars[i] <= '9') ||
+                          chars[i] == '.')) {
+      if (chars[i] != '.') {
+        haveDigits = true;
+      }
+      ++i;
+    }
+    if (!haveDigits) {
+      return false;
+    }
+    nsAutoString number(Substring(aValue, start, i - start));
+    nsresult rv = NS_OK;
+    aNumber = number.ToFloat(&rv);
+    if (NS_FAILED(rv)) {
+      return false;
+    }
+    aUnit = Substring(aValue, i);
+    aUnit.CompressWhitespace(true, true);
+    return true;
+  };
+
+  float actual, wanted;
+  nsAutoString actualUnit, wantedUnit;
+  if (!split(aActual, actual, actualUnit) ||
+      !split(aWanted, wanted, wantedUnit) ||
+      !actualUnit.Equals(wantedUnit)) {
+    return ContainerEval::Unknown;
+  }
+
+  switch (aOperator) {
+    case ContainerStyleQuery::eLessThan:
+      return actual < wanted ? ContainerEval::True : ContainerEval::False;
+    case ContainerStyleQuery::eLessThanEqual:
+      return actual <= wanted ? ContainerEval::True : ContainerEval::False;
+    case ContainerStyleQuery::eGreaterThan:
+      return actual > wanted ? ContainerEval::True : ContainerEval::False;
+    case ContainerStyleQuery::eGreaterThanEqual:
+      return actual >= wanted ? ContainerEval::True : ContainerEval::False;
+    default:
+      return ContainerEval::Unknown;
+  }
+}
+
+// Compare one parsed style() query against the container's computed style.
+// Anything that cannot be answered is unknown, so that "not style(...)" stays
+// unknown instead of turning into a match.
+static ContainerEval
+StyleQueryAgainstContainer(const ContainerStyleQuery& aQuery,
+                           Element* aContainer, nsPresContext* aPresContext)
+{
+  nsIFrame* frame = aContainer->GetPrimaryFrame();
+  if (!frame) {
+    return ContainerEval::Unknown;
+  }
+  nsStyleContext* sc = frame->StyleContext();
+
+  if (eCSSPropertyExtra_variable == aQuery.mProperty) {
+    // Computed variables are keyed without the "--" prefix.
+    nsAutoString name;
+    aQuery.mName.Right(name, aQuery.mName.Length() - 2);
+    const CSSVariableValues& vars = sc->StyleVariables()->mVariables;
+
+    nsAutoString actual;
+    const bool found = vars.Get(name, actual);
+
+    switch (aQuery.mValueType) {
+      case CSSVariableDeclarations::eTokenStream: {
+        if (!found) {
+          return ContainerEval::False;
+        }
+        if (!aQuery.mHasValue && aQuery.mOperator == ContainerStyleQuery::eNone) {
+          return ContainerEval::True;
+        }
+        nsAutoString wanted;
+        if (!ResolveStyleQueryText(aQuery.mValueText, &vars, wanted)) {
+          return ContainerEval::Unknown;
+        }
+        nsAutoString got, want;
+        NormaliseTokenStream(actual, got);
+        NormaliseTokenStream(wanted, want);
+        return CompareStyleValues(got, want, aQuery.mOperator);
+      }
+
+      case CSSVariableDeclarations::eInherit: {
+        // Inheritance has already happened, so the container's own value is the
+        // parent's unless the container overrides it.
+        nsStyleContext* parent = sc->GetParent();
+        nsAutoString inherited;
+        const bool inheritedFound =
+          parent && parent->StyleVariables()->mVariables.Get(name, inherited);
+        if (!found || !inheritedFound) {
+          return (found == inheritedFound) ? ContainerEval::True
+                                           : ContainerEval::False;
+        }
+        nsAutoString got, want;
+        NormaliseTokenStream(actual, got);
+        NormaliseTokenStream(inherited, want);
+        return CompareStyleValues(got, want, aQuery.mOperator);
+      }
+
+      default:
+        // initial, unset and revert all land on the guaranteed-invalid value
+        // for a custom property, which is simply absent from the computed set.
+        // The set carries no cascade origin, so they are not told apart.
+        return found ? ContainerEval::False : ContainerEval::True;
+    }
+  }
+
+  // A normal property: read the computed value.  The frame's existing style
+  // context is what nsComputedDOMStyle uses here, so nothing is flushed.
+  nsIDocument* doc = aContainer->OwnerDoc();
+  nsIPresShell* shell = doc->GetShell();
+  if (!shell) {
+    return ContainerEval::Unknown;
+  }
+  RefPtr<nsComputedDOMStyle> computed =
+    NS_NewComputedDOMStyle(aContainer, EmptyString(), doc,
+                           nsComputedDOMStyle::eAll);
+  nsAutoString actualText;
+  if (!computed ||
+      NS_FAILED(computed->GetPropertyValue(aQuery.mProperty, actualText)) ||
+      actualText.IsEmpty()) {
+    // Unknown property, or one the computed-style table cannot serialise.
+    return ContainerEval::Unknown;
+  }
+  if (!aQuery.mHasValue) {
+    return ContainerEval::True;
+  }
+
+  // Parse the computed text so both sides compare as values rather than as
+  // strings; "1px" and "1px" must not depend on formatting.
+  nsCSSParser parser;
+  nsCSSValue actual;
+  parser.ParseLonghandProperty(aQuery.mProperty, actualText, nullptr, nullptr,
+                               nullptr, actual);
+  if (eCSSUnit_Null == actual.GetUnit()) {
+    return ContainerEval::Unknown;
+  }
+
+  // Ordering has to be answered before the equality shortcut, or `--x < 5`
+  // would come back true on a value of exactly 5.  Both sides go back to text
+  // and the shared comparison handles the rest.
+  if (aQuery.mOperator != ContainerStyleQuery::eNone) {
+    nsAutoString actualSerialised, wantedSerialised;
+    actual.AppendToString(aQuery.mProperty, actualSerialised,
+                          nsCSSValue::eNormalized);
+    aQuery.mValue.AppendToString(aQuery.mProperty, wantedSerialised,
+                                 nsCSSValue::eNormalized);
+    nsAutoString gotText, wantText;
+    NormaliseTokenStream(actualSerialised, gotText);
+    NormaliseTokenStream(wantedSerialised, wantText);
+    return CompareStyleValues(gotText, wantText, aQuery.mOperator);
+  }
+
+  if (actual == aQuery.mValue) {
+    return ContainerEval::True;
+  }
+  // A computed value is canonicalised, so "red" and "rgb(255, 0, 0)" differ as
+  // values while being the same colour; compare colours as colours.
+  nscolor got, want;
+  if (nsRuleNode::ComputeColor(actual, aPresContext, sc, got) &&
+      nsRuleNode::ComputeColor(aQuery.mValue, aPresContext, sc, want)) {
+    return got == want ? ContainerEval::True : ContainerEval::False;
+  }
+  return ContainerEval::False;
+}
+
+// The reference length for one axis of a container query length unit.  The
+// unit is resolved as if it were written on the query container, so the walk
+// starts at the container's parent and never considers the container itself:
+// its own size is what the feature compares against.  The axis named here is
+// the candidate's own, so it is mapped to physical with the candidate's
+// writing mode.
+static float
+UnitReferenceForAxis(Element* aQueryContainer, bool aBlockAxis, bool aVertical,
+                     nsPresContext* aPresContext)
+{
+  for (Element* e = aQueryContainer->GetParentElement(); e;
+       e = e->GetParentElement()) {
+    nsIFrame* frame = e->GetPrimaryFrame();
+    if (!frame) {
+      continue;
+    }
+    const nsStyleDisplay* display = frame->StyleDisplay();
+    if (!display->IsContainerForSizeQueries()) {
+      continue;
+    }
+    const bool vertical = frame->GetWritingMode().IsVertical();
+    const bool blockQueryable =
+      display->mContainerType == NS_STYLE_CONTAINER_TYPE_SIZE;
+    if (aBlockAxis && !blockQueryable) {
+      continue;
+    }
+    // The axis named here is the candidate's own, so map it to physical.  The
+    // specified size wins where containment makes it authoritative; the rect
+    // is the fallback.
+    const bool width = aBlockAxis == vertical;
+    const nsStyleCoord& coord = width
+                                  ? frame->StylePosition()->mWidth
+                                  : frame->StylePosition()->mHeight;
+    if ((!aBlockAxis || blockQueryable) && coord.ConvertsToLength()) {
+      return nsPresContext::AppUnitsToFloatCSSPixels(coord.GetCoordValue());
+    }
+    const nsSize rect = frame->GetContentRectRelativeToSelf().Size();
+    return nsPresContext::AppUnitsToFloatCSSPixels(width ? rect.width
+                                                         : rect.height);
+  }
+
+  // No eligible ancestor: the small viewport for the axis.  Logical axes
+  // follow the query container's writing mode.
+  nsSize viewport = aPresContext->GetVisibleArea().Size();
+  const float width = nsPresContext::AppUnitsToFloatCSSPixels(viewport.width);
+  const float height = nsPresContext::AppUnitsToFloatCSSPixels(viewport.height);
+  return (aBlockAxis == aVertical) ? width : height;
+}
+
+bool
+FindQueryContainerForStyleContext(nsStyleContext* aStyleContext, bool aBlockAxis,
+                                  nsPresContext* aPresContext, ContainerUnitsScale& aSize)
+{
+  // Walk the style context chain rather than the element chain.  Style
+  // resolution runs ahead of reflow -- and for a display:none subtree it never
+  // reaches the elements at all -- so frame lookups miss containers that are
+  // perfectly good ones.  Resolving them through nsComputedDOMStyle would work
+  // but re-enters style resolution, and an ancestor with cq units of its own
+  // re-enters again, which compounds badly.  The parent chain is already
+  // resolved and costs nothing to walk.
+  //
+  // The nearest context with element content is the element to record as a
+  // dependent: an anonymous box or pseudo-element inherits from its
+  // originating element and a keyframe context from the element it belongs to,
+  // and restyling that element restyles what sits below it.
+  Element* dependent = nullptr;
+  for (nsStyleContext* sc = aStyleContext; sc && !dependent;
+       sc = sc->GetParent()) {
+    nsIContent* content = sc->GetContent();
+    if (content && content->IsElement()) {
+      dependent = content->AsElement();
+    }
+  }
+
+  // Container units resolve against the nearest *ancestor* container, so the
+  // element's own context is skipped.  A pseudo-element's context parents off
+  // its originating element, so the originating element stays in range.
+  for (nsStyleContext* sc = aStyleContext->GetParent(); sc;
+       sc = sc->GetParent()) {
+    nsIContent* content = sc->GetContent();
+    Element* element =
+      content && content->IsElement() ? content->AsElement() : nullptr;
+    if (!element) {
+      continue;
+    }
+    const nsStyleDisplay* display = sc->StyleDisplay();
+    if (!display->IsContainerForSizeQueries()) {
+      continue;
+    }
+
+    // Only the inline axis is queryable unless the container is `size`.
+    const bool blockQueryable =
+      display->mContainerType == NS_STYLE_CONTAINER_TYPE_SIZE;
+    if (aBlockAxis && !blockQueryable) {
+      continue;
+    }
+
+    const bool vertical = WritingMode(sc).IsVertical();
+    aSize.mVertical = vertical;
+    aSize.mBlockQueryable = blockQueryable;
+
+    // The box may not have been reflowed, and may not have a box at all.
+    nsIFrame* frame = element->GetPrimaryFrame();
+    nsSize rect(0, 0);
+    if (frame) {
+      rect = frame->GetContentRectRelativeToSelf().Size();
+    }
+    const nsSize basis = ContainingBlockBasis(sc->GetParent());
+    aSize.mWidth = QueryableExtent(sc, rect, basis, true, vertical, blockQueryable);
+    aSize.mHeight = QueryableExtent(sc, rect, basis, false, vertical, blockQueryable);
+
+    if (dependent && frame) {
+      auto* dependents = static_cast<ContainerQueryDependents*>(
+          frame->GetProperty(nsIFrame::ContainerQueryDependentsProperty()));
+      const uint32_t generation = aPresContext->ContainerQueryGeneration();
+      if (!dependents) {
+        dependents = new ContainerQueryDependents();
+        frame->SetProperty(nsIFrame::ContainerQueryDependentsProperty(),
+                           dependents);
+        dependents->mGeneration = generation;
+      } else if (dependents->mGeneration != generation) {
+        dependents->mElements.Clear();
+        dependents->mGeneration = generation;
+      }
+      if (!dependents->mElements.Contains(dependent)) {
+        dependents->mElements.AppendElement(dependent);
+      }
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+// Compares a measured value against the required one for a given range.
+static ContainerEval
+CompareFeatureValue(float aActual, float aRequired,
+                    nsMediaExpression::Range aRange)
+{
+  switch (aRange) {
+    case nsMediaExpression::eMin:
+      return aActual >= aRequired ? ContainerEval::True
+                                  : ContainerEval::False;
+    case nsMediaExpression::eMinExclusive:
+      return aActual > aRequired ? ContainerEval::True
+                                 : ContainerEval::False;
+    case nsMediaExpression::eMax:
+      return aActual <= aRequired ? ContainerEval::True
+                                  : ContainerEval::False;
+    case nsMediaExpression::eMaxExclusive:
+      return aActual < aRequired ? ContainerEval::True
+                                 : ContainerEval::False;
+    case nsMediaExpression::eEqual:
+      return aActual == aRequired ? ContainerEval::True
+                                  : ContainerEval::False;
+    default:
+      return ContainerEval::Unknown;
+  }
+}
+
+// True when any leaf is a size feature in rem, which ties the whole tree to the
+// root element's font size.  A leaf the selected container cannot answer still
+// counts: the dependency is on the value, not on whether it matches.
+static bool
+ConditionUsesRootEM(const nsContainerCondition& aCondition)
+{
+  if (aCondition.GetKind() == nsContainerCondition::eFeature &&
+      aCondition.GetExpression().mValue.GetUnit() == eCSSUnit_RootEM) {
+    return true;
+  }
+  for (const RefPtr<nsContainerCondition>& operand : aCondition.GetOperands()) {
+    if (ConditionUsesRootEM(*operand)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static ContainerEval
+SizeFeatureAgainstContainer(const nsMediaExpression* aExpr,
+                            const ContainerSize& aSize,
+                            nsPresContext* aPresContext,
+                            nscoord aFontSize)
+{
+  // Belt and braces: an expression is only valid once its feature resolved.
+  if (!aExpr->mFeature || !aExpr->mFeature->mName) {
+    return ContainerEval::Unknown;
+  }
+
+  // Feature atoms are spelled with hyphens ("min-width") but the gkAtoms in
+  // this tree are not, so normalise before comparing.
+  nsAutoString name;
+  (*aExpr->mFeature->mName)->ToString(name);
+  name.StripChars("-");
+
+  const nsCSSValue& value = aExpr->mValue;
+
+  switch (aExpr->mFeature->mValueType) {
+    case nsMediaFeature::eFloatRatio: {
+      if (!name.EqualsLiteral("aspectratio") ||
+          !aSize.mBlockQueryable || aSize.mHeight <= 0.0f ||
+          value.GetUnit() != eCSSUnit_Array) {
+        return ContainerEval::Unknown;
+      }
+      const nsCSSValue::Array* ratio = value.GetArrayValue();
+      if (ratio->Count() != 2 ||
+          ratio->Item(0).GetUnit() != eCSSUnit_Number ||
+          ratio->Item(1).GetUnit() != eCSSUnit_Number ||
+          ratio->Item(1).GetFloatValue() <= 0.0f) {
+        // A zero denominator is a legal infinite ratio, but not worth
+        // special-casing until something needs it.
+        return ContainerEval::Unknown;
+      }
+      // The ratio is scale invariant, so the unit the rect is measured in
+      // drops out and no app-unit conversion is needed.
+      return CompareFeatureValue(
+        aSize.mWidth / aSize.mHeight,
+        ratio->Item(0).GetFloatValue() / ratio->Item(1).GetFloatValue(),
+        aExpr->mRange);
+    }
+
+    case nsMediaFeature::eEnumerated: {
+      // orientation is eMinMaxNotAllowed, so the range is always eEqual.
+      if (!name.EqualsLiteral("orientation") ||
+          !aSize.mBlockQueryable ||
+          value.GetUnit() != eCSSUnit_Enumerated) {
+        return ContainerEval::Unknown;
+      }
+      // Square containers are portrait, as in GetOrientation.
+      int32_t actual = aSize.mWidth > aSize.mHeight
+                         ? NS_STYLE_ORIENTATION_LANDSCAPE
+                         : NS_STYLE_ORIENTATION_PORTRAIT;
+      return value.GetIntValue() == actual ? ContainerEval::True
+                                           : ContainerEval::False;
+    }
+
+    case nsMediaFeature::eLength:
+      break;
+
+    default:
+      return ContainerEval::Unknown;
+  }
+
+  float actual;
+  bool queryable = true;
+  if (name.EqualsLiteral("width") ||
+      name.EqualsLiteral("minwidth") ||
+      name.EqualsLiteral("maxwidth")) {
+    actual = aSize.mWidth;
+    // width is the block axis in a vertical writing mode.
+    queryable = aSize.mVertical ? aSize.mBlockQueryable : true;
+  } else if (name.EqualsLiteral("height") ||
+             name.EqualsLiteral("minheight") ||
+             name.EqualsLiteral("maxheight")) {
+    actual = aSize.mHeight;
+    queryable = aSize.mVertical ? true : aSize.mBlockQueryable;
+  } else if (name.EqualsLiteral("inlinesize") ||
+             name.EqualsLiteral("mininlinesize") ||
+             name.EqualsLiteral("maxinlinesize")) {
+    actual = aSize.mVertical ? aSize.mHeight : aSize.mWidth;
+  } else if (name.EqualsLiteral("blocksize") ||
+             name.EqualsLiteral("minblocksize") ||
+             name.EqualsLiteral("maxblocksize")) {
+    actual = aSize.mVertical ? aSize.mWidth : aSize.mHeight;
+    queryable = aSize.mBlockQueryable;
+  } else {
+    // device-width, resolution, etc.
+    return ContainerEval::Unknown;
+  }
+  if (!queryable) {
+    return ContainerEval::Unknown;
+  }
+
+  float required;
+  if (value.IsPixelLengthUnit()) {
+    required = nsPresContext::AppUnitsToFloatCSSPixels(value.GetPixelLength());
+  } else if (value.GetUnit() == eCSSUnit_EM) {
+    required = nsPresContext::AppUnitsToFloatCSSPixels(aFontSize) *
+               value.GetFloatValue();
+  } else if (value.GetUnit() == eCSSUnit_RootEM) {
+    // A rem is the root element's font-size, never the container's, so it is
+    // resolved against the root whatever the container happens to inherit.
+    required = nsPresContext::AppUnitsToFloatCSSPixels(aSize.mRootFontSize) *
+               value.GetFloatValue();
+  } else if (value.GetUnit() >= eCSSUnit_CQW &&
+             value.GetUnit() <= eCSSUnit_CQMax) {
+    // The unit's reference axis need not be the axis being queried, so it
+    // needs its own availability check.
+    float reference;
+    switch (value.GetUnit()) {
+      case eCSSUnit_CQW:
+        reference = aSize.mVertical ? aSize.mUnitBlock : aSize.mUnitInline;
+        break;
+      case eCSSUnit_CQH:
+        reference = aSize.mVertical ? aSize.mUnitInline : aSize.mUnitBlock;
+        break;
+      case eCSSUnit_CQI:
+        reference = aSize.mUnitInline;
+        break;
+      case eCSSUnit_CQB:
+        reference = aSize.mUnitBlock;
+        break;
+      default: {
+        const float lo = std::min(aSize.mUnitInline, aSize.mUnitBlock);
+        const float hi = std::max(aSize.mUnitInline, aSize.mUnitBlock);
+        reference = value.GetUnit() == eCSSUnit_CQMin ? lo : hi;
+        break;
+      }
+    }
+    required = reference * value.GetFloatValue() / 100.0f;
+  } else {
+    return ContainerEval::Unknown;
+  }
+
+  return CompareFeatureValue(actual, required, aExpr->mRange);
+}
+
+// True when the expression can only be answered from the container's block
+// axis, which an `inline-size` container cannot provide.  Writing mode decides
+// which of the width/height pair that is.
+static bool
+FeatureNeedsBlockAxis(const nsMediaExpression& aExpr, bool aVertical)
+{
+  if (!aExpr.mFeature || !aExpr.mFeature->mName) {
+    return false;
+  }
+  nsAutoString name;
+  (*aExpr.mFeature->mName)->ToString(name);
+  name.StripChars("-");
+
+  if (name.EqualsLiteral("blocksize") ||
+      name.EqualsLiteral("minblocksize") ||
+      name.EqualsLiteral("maxblocksize") ||
+      name.EqualsLiteral("aspectratio") ||
+      name.EqualsLiteral("orientation")) {
+    return true;
+  }
+  if (aVertical) {
+    return name.EqualsLiteral("width") || name.EqualsLiteral("minwidth") ||
+           name.EqualsLiteral("maxwidth");
+  }
+  return name.EqualsLiteral("height") || name.EqualsLiteral("minheight") ||
+         name.EqualsLiteral("maxheight");
+}
+
+// True when any leaf in the tree needs the block axis.
+static bool
+ConditionNeedsBlockAxis(const nsContainerCondition& aCondition, bool aVertical)
+{
+  if (aCondition.GetKind() == nsContainerCondition::eFeature) {
+    return FeatureNeedsBlockAxis(aCondition.GetExpression(), aVertical);
+  }
+  for (const RefPtr<nsContainerCondition>& operand : aCondition.GetOperands()) {
+    if (ConditionNeedsBlockAxis(*operand, aVertical)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+namespace {
+class ContainerConditionEvaluator final : public nsContainerConditionEvaluator
+{
+public:
+  ContainerConditionEvaluator(const ContainerSize& aSize,
+                              nsPresContext* aPresContext, Element* aElement,
+                              const nsString& aName)
+    : mSize(aSize), mPresContext(aPresContext), mElement(aElement),
+      mName(aName) {}
+
+  ContainerEval EvaluateFeature(const nsMediaExpression& aExpression) override
+  {
+    return SizeFeatureAgainstContainer(&aExpression, mSize, mPresContext,
+                                       mSize.mFontSize);
+  }
+
+  ContainerEval EvaluateStyle(const nsContainerCondition& aCondition) override
+  {
+    Element* container = nullptr;
+    if (!FindStyleContainer(mElement, mName, mPresContext, &container)) {
+      // No style container, so nothing can answer it.
+      return ContainerEval::Unknown;
+    }
+    return StyleQueryAgainstContainer(aCondition.GetStyle(), container,
+                                      mPresContext);
+  }
+
+private:
+  const ContainerSize& mSize;
+  nsPresContext* mPresContext;
+  Element* mElement;
+  const nsString& mName;
+};
+} // anonymous namespace
+
+// True when the tree holds a size feature.  A tree of style() leaves alone needs
+// no size container, so the size walk must not be allowed to fail it.
+static bool
+ConditionHasSizeFeature(const nsContainerCondition& aCondition)
+{
+  if (aCondition.GetKind() == nsContainerCondition::eFeature) {
+    return true;
+  }
+  for (const RefPtr<nsContainerCondition>& operand : aCondition.GetOperands()) {
+    if (ConditionHasSizeFeature(*operand)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The tree is evaluated against the nearest eligible container with
+// three-valued logic; unknown resolves false.
+static ContainerEval
+EvaluateContainerCondition(const nsContainerConditionPair& aPair,
+                           Element* aElement, nsPresContext* aPresContext)
+{
+  const nsContainerCondition* aCondition = aPair.mCondition;
+  const nsString& aName = aPair.mName;
+  ContainerSize size;
+
+  // A name with no condition only asks for the container to exist.
+  if (!aCondition) {
+    return FindQueryContainer(aElement, aName, size, aPresContext, false,
+                              false, nullptr)
+             ? ContainerEval::True
+             : ContainerEval::False;
+  }
+
+  // Arm the root-font dependency before the container walk, which can fail.
+  const bool usesRootEM = ConditionUsesRootEM(*aCondition);
+  if (usesRootEM) {
+    aPresContext->SetUsesRootEMUnits(true);
+  }
+
+  // Style leaves resolve against the nearest style container, which need not be
+  // a size container, so the size walk is only owed when the tree has a size
+  // feature.
+  const bool needsSize = ConditionHasSizeFeature(*aCondition);
+
+  // The block axis can only be answered by a `size` container, so a condition
+  // needing it has to skip past `inline-size` containers while selecting.
+  // Every leaf resolves against the container that gets selected, so one
+  // block-axis leaf is enough to constrain the whole selection.
+  bool blockAxis = false;
+  if (needsSize) {
+    WritingMode wm;
+    if (nsIFrame* frame = aElement->GetPrimaryFrame()) {
+      wm = frame->GetWritingMode();
+    }
+    blockAxis = ConditionNeedsBlockAxis(*aCondition, wm.IsVertical());
+  }
+
+  Element* container = nullptr;
+  if (needsSize &&
+      !FindQueryContainer(aElement, aName, size, aPresContext, blockAxis,
+                          usesRootEM, &container)) {
+    return ContainerEval::False;
+  }
+
+  // Container query length units measure the container's ancestors, so they
+  // need their own walk.  cqmin/cqmax take both axes, which may come from
+  // different containers.
+  if (needsSize) {
+    size.mUnitInline =
+      UnitReferenceForAxis(container, false, size.mVertical, aPresContext);
+    size.mUnitBlock =
+      UnitReferenceForAxis(container, true, size.mVertical, aPresContext);
+  }
+
+  ContainerConditionEvaluator evaluator(size, aPresContext, aElement, aName);
+  return aCondition->Matches(evaluator);
+}
+
+static inline void
+ContentEnumFunc(const RuleValue& value,
+                nsCSSSelector* aSelector,
+                ElementDependentRuleProcessorData* data,
+                NodeMatchContext& nodeContext,
+                AncestorFilter* ancestorFilter)
+{
+  if (nodeContext.mIsRelevantLink) {
+    data->mTreeMatchContext.SetHaveRelevantLink();
+  }
+  // XXX: Ignore the ancestor filter if we're testing the assigned slot.
+  bool useAncestorFilter = !(data->mTreeMatchContext.mForAssignedSlot ||
+                             data->mTreeMatchContext.mOnlyMatchHostPseudo);
+  if (useAncestorFilter && ancestorFilter &&
+      !ancestorFilter->MightHaveMatchingAncestor<RuleValue::eMaxAncestorHashes>(
+        value.mAncestorSelectorHashes)) {
+    // We won't match; nothing else to do here
+    return;
+  }
+
+  if (!LookForTargetPseudo(aSelector, &data->mTreeMatchContext, nullptr)) {
+    return;
+  }
+
+  if (!data->mTreeMatchContext.SetStyleScopeForSelectorMatching(data->mElement,
+                                                                data->mScope)) {
+    // The selector is for a rule in a scoped style sheet, and the subject
+    // of the selector matching is not in its scope.
+    return;
+  }
+  nsCSSSelector* selector = aSelector;
+  if (selector->IsPseudoElement()) {
+    PseudoElementRuleProcessorData* pdata =
+      static_cast<PseudoElementRuleProcessorData*>(data);
+    if (!pdata->mPseudoElement && selector->mPseudoClassList) {
+      // We can get here when calling getComputedStyle(aElt, aPseudo) if:
+      //
+      //   * aPseudo is a pseudo-element that supports a user action
+      //     pseudo-class, like "::placeholder";
+      //   * there is a style rule that uses a pseudo-class on this
+      //     pseudo-element in the document, like ::placeholder:hover; and
+      //   * aElt does not have such a pseudo-element.
+      //
+      // We know that the selector can't match, since there is no element for
+      // the user action pseudo-class to match against.
+      return;
+    }
+    if (!nsCSSRuleUtils::StateSelectorMatches(pdata->mPseudoElement,
+                                              aSelector,
+                                              nodeContext,
+                                              data->mTreeMatchContext,
+                                              SelectorMatchesFlags::NONE)) {
+      return;
+    }
+    selector = selector->mNext;
+  }
+
+  SelectorMatchesFlags selectorFlags = SelectorMatchesFlags::NONE;
+  if (aSelector->IsPseudoElement()) {
+    selectorFlags |= SelectorMatchesFlags::HAS_PSEUDO_ELEMENT;
+  }
+  if (nsCSSRuleUtils::SelectorMatches(data->mElement,
+                                      selector,
+                                      nodeContext,
+                                      data->mTreeMatchContext,
+                                      selectorFlags)) {
+    Element* treeMatchStart = data->mElement;
+    if (SelectorContainsPseudoClass(selector, CSSPseudoClassType::part)) {
+      nsIContent* partHost = data->mElement->GetContainingShadowHost();
+      if (!partHost || !partHost->IsElement()) {
+        return;
+      }
+      treeMatchStart = partHost->AsElement();
+    }
+
+    nsCSSSelector* next = selector->mNext;
+    if (!next || nsCSSRuleUtils::SelectorMatchesTree(
+                   treeMatchStart,
+                   next,
+                   data->mTreeMatchContext,
+                   nodeContext.mIsRelevantLink ? SelectorMatchesTreeFlags(0)
+                                               : eLookForRelevantLink)) {
+      // A rule with no pairs is an ordinary rule and always applies.  Otherwise
+      // any pair matching applies it.
+      const nsTArray<nsContainerConditionPair>& conditions =
+        value.mRule->GetContainerConditions();
+      if (!conditions.IsEmpty()) {
+        bool matched = false;
+        for (const nsContainerConditionPair& pair : conditions) {
+          if (EvaluateContainerCondition(pair, data->mElement,
+                                         data->mPresContext) ==
+              ContainerEval::True) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          return;
+        }
+      }
+      css::Declaration* declaration = value.mRule->GetDeclaration();
+      declaration->SetImmutable();
+      data->mRuleWalker->Forward(declaration);
+      // nsStyleSet will deal with the !important rule
+    }
+  }
+}
+
+void
+RuleHash::EnumerateAllRules(Element* aElement,
+                            ElementDependentRuleProcessorData* aData,
+                            NodeMatchContext& aNodeContext)
+{
+  int32_t nameSpace = aElement->GetNameSpaceID();
+  nsIAtom* tag = aElement->NodeInfo()->NameAtom();
+  nsIAtom* id = aElement->GetID();
+  const nsAttrValue* classList = aElement->GetClasses();
+
+  MOZ_ASSERT(tag, "How could we not have a tag?");
+
+  int32_t classCount = classList ? classList->GetAtomCount() : 0;
+
+  // assume 1 universal, tag, id, and namespace, rather than wasting
+  // time counting
+  int32_t testCount = classCount + 4;
+
+  // Style resolution can re-enter itself: resolving a container-unit reference
+  // resolves the container's style from inside this walk.  A nested
+  // enumeration therefore cannot use mEnumList, since it would overwrite both
+  // the entries and the mCurValue/mEnd cursors that the outer loop still holds
+  // pointers into.
+  AutoTArray<EnumData, MIN_ENUM_LIST_SIZE> nestedEnumList;
+  EnumData* enumList;
+  if (mEnumListDepth > 0) {
+    nestedEnumList.SetLength(testCount);
+    enumList = nestedEnumList.Elements();
+  } else {
+    if (mEnumListSize < testCount) {
+      delete[] mEnumList;
+      mEnumListSize = std::max(testCount, MIN_ENUM_LIST_SIZE);
+      mEnumList = new EnumData[mEnumListSize];
+    }
+    enumList = mEnumList;
+  }
+  ++mEnumListDepth;
+
+  int32_t valueCount = 0;
+  RULE_HASH_STAT_INCREMENT(mElementsMatched);
+
+  if (mUniversalRules.Length() != 0) { // universal rules
+    enumList[valueCount++] = ToEnumData(mUniversalRules);
+    RULE_HASH_STAT_INCREMENT_LIST_COUNT(mUniversalRules,
+                                        mElementUniversalCalls);
+  }
+  // universal rules within the namespace
+  if (kNameSpaceID_Unknown != nameSpace && mNameSpaceTable.EntryCount() > 0) {
+    auto entry = static_cast<RuleHashTableEntry*>(
+      mNameSpaceTable.Search(NS_INT32_TO_PTR(nameSpace)));
+    if (entry) {
+      enumList[valueCount++] = ToEnumData(entry->mRules);
+      RULE_HASH_STAT_INCREMENT_LIST_COUNT(entry->mRules,
+                                          mElementNameSpaceCalls);
+    }
+  }
+  if (mTagTable.EntryCount() > 0) {
+    auto entry = static_cast<RuleHashTableEntry*>(mTagTable.Search(tag));
+    if (entry) {
+      enumList[valueCount++] = ToEnumData(entry->mRules);
+      RULE_HASH_STAT_INCREMENT_LIST_COUNT(entry->mRules, mElementTagCalls);
+    }
+  }
+  if (id && mIdTable.EntryCount() > 0) {
+    auto entry = static_cast<RuleHashTableEntry*>(mIdTable.Search(id));
+    if (entry) {
+      enumList[valueCount++] = ToEnumData(entry->mRules);
+      RULE_HASH_STAT_INCREMENT_LIST_COUNT(entry->mRules, mElementIdCalls);
+    }
+  }
+  if (mClassTable.EntryCount() > 0) {
+    for (int32_t index = 0; index < classCount; ++index) {
+      auto entry = static_cast<RuleHashTableEntry*>(
+        mClassTable.Search(classList->AtomAt(index)));
+      if (entry) {
+        enumList[valueCount++] = ToEnumData(entry->mRules);
+        RULE_HASH_STAT_INCREMENT_LIST_COUNT(entry->mRules, mElementClassCalls);
+      }
+    }
+  }
+  NS_ASSERTION(valueCount <= testCount, "values exceeded list size");
+
+  if (valueCount > 0) {
+    AncestorFilter* filter =
+      aData->mTreeMatchContext.mAncestorFilter.HasFilter()
+        ? &aData->mTreeMatchContext.mAncestorFilter
+        : nullptr;
+#ifdef DEBUG
+    bool isRestricted = (aData->mTreeMatchContext.mShadowHosts.Length() > 0 ||
+                         aData->mTreeMatchContext.mRestrictToSlottedPseudo ||
+                         aData->mTreeMatchContext.mOnlyMatchHostPseudo ||
+                         aData->mTreeMatchContext.mForAssignedSlot);
+    if (filter && !isRestricted) {
+      filter->AssertHasAllAncestors(aElement);
+    }
+#endif
+    bool isForAssignedSlot = aData->mTreeMatchContext.mForAssignedSlot;
+    // Merge the lists while there are still multiple lists to merge.
+    while (valueCount > 1) {
+      int32_t valueIndex = 0;
+      int32_t lowestRuleIndex = enumList[valueIndex].mCurValue->mIndex;
+      for (int32_t index = 1; index < valueCount; ++index) {
+        int32_t ruleIndex = enumList[index].mCurValue->mIndex;
+        if (ruleIndex < lowestRuleIndex) {
+          valueIndex = index;
+          lowestRuleIndex = ruleIndex;
+        }
+      }
+      const RuleValue* cur = enumList[valueIndex].mCurValue;
+      aData->mTreeMatchContext.mForAssignedSlot = isForAssignedSlot;
+      ContentEnumFunc(*cur, cur->mSelector, aData, aNodeContext, filter);
+      cur++;
+      if (cur == enumList[valueIndex].mEnd) {
+        enumList[valueIndex] = enumList[--valueCount];
+      } else {
+        enumList[valueIndex].mCurValue = cur;
+      }
+    }
+
+    // Fast loop over single value.
+    for (const RuleValue *value = enumList[0].mCurValue,
+                              *end = enumList[0].mEnd;
+         value != end;
+         ++value) {
+      aData->mTreeMatchContext.mForAssignedSlot = isForAssignedSlot;
+      ContentEnumFunc(*value, value->mSelector, aData, aNodeContext, filter);
+    }
+  }
+
+  --mEnumListDepth;
+}
+
+static size_t
+SizeOfRuleHashTable(const PLDHashTable& aTable, MallocSizeOf aMallocSizeOf)
+{
+  size_t n = aTable.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (auto iter = aTable.ConstIter(); !iter.Done(); iter.Next()) {
+    auto entry = static_cast<RuleHashTableEntry*>(iter.Get());
+    n += entry->mRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+  return n;
+}
+
+size_t
+RuleHash::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
+{
+  size_t n = 0;
+
+  n += SizeOfRuleHashTable(mIdTable, aMallocSizeOf);
+
+  n += SizeOfRuleHashTable(mClassTable, aMallocSizeOf);
+
+  n += SizeOfRuleHashTable(mTagTable, aMallocSizeOf);
+
+  n += SizeOfRuleHashTable(mNameSpaceTable, aMallocSizeOf);
+
+  n += mUniversalRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+
+  return n;
+}
+
+size_t
+RuleHash::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const
+{
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+//--------------------------------
+
+// A hash table mapping atoms to lists of selectors
+struct AtomSelectorEntry : public PLDHashEntryHdr
+{
+  nsIAtom* mAtom;
+  // Auto length 2, because a decent fraction of these arrays ends up
+  // with 2 elements, and each entry is cheap.
+  AutoTArray<SelectorPair, 2> mSelectors;
+};
+
+static void
+AtomSelector_ClearEntry(PLDHashTable* table, PLDHashEntryHdr* hdr)
+{
+  (static_cast<AtomSelectorEntry*>(hdr))->~AtomSelectorEntry();
+}
+
+static void
+AtomSelector_InitEntry(PLDHashEntryHdr* hdr, const void* key)
+{
+  AtomSelectorEntry* entry = static_cast<AtomSelectorEntry*>(hdr);
+  new (KnownNotNull, entry) AtomSelectorEntry();
+  entry->mAtom = const_cast<nsIAtom*>(static_cast<const nsIAtom*>(key));
+}
+
+static void
+AtomSelector_MoveEntry(PLDHashTable* table,
+                       const PLDHashEntryHdr* from,
+                       PLDHashEntryHdr* to)
+{
+  NS_PRECONDITION(from != to, "This is not going to work!");
+  AtomSelectorEntry* oldEntry =
+    const_cast<AtomSelectorEntry*>(static_cast<const AtomSelectorEntry*>(from));
+  auto* newEntry = new (KnownNotNull, to) AtomSelectorEntry();
+  newEntry->mAtom = oldEntry->mAtom;
+  newEntry->mSelectors.SwapElements(oldEntry->mSelectors);
+  oldEntry->~AtomSelectorEntry();
+}
+
+static bool
+AtomSelector_CIMatchEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  const AtomSelectorEntry* entry = static_cast<const AtomSelectorEntry*>(hdr);
+  return CIMatchAtoms(key, entry->mAtom);
+}
+
+// Case-sensitive ops.
+/* static */ const PLDHashTableOps RuleCascadeData::AtomSelector_CSOps = {
+  PLDHashTable::HashVoidPtrKeyStub,
+  PLDHashTable::MatchEntryStub,
+  AtomSelector_MoveEntry,
+  AtomSelector_ClearEntry,
+  AtomSelector_InitEntry
+};
+
+// Case-insensitive ops.
+/* static */ const PLDHashTableOps RuleCascadeData::AtomSelector_CIOps = {
+  RuleHash_CIHashKey,
+  AtomSelector_CIMatchEntry,
+  AtomSelector_MoveEntry,
+  AtomSelector_ClearEntry,
+  AtomSelector_InitEntry
+};
+
+RuleCascadeData::RuleCascadeData(bool aQuirksMode)
+  : mRuleHash(aQuirksMode)
+  , mStateSelectors()
+  , mSelectorDocumentStates(0)
+  , mClassSelectors(aQuirksMode ? &AtomSelector_CIOps : &AtomSelector_CSOps,
+                    sizeof(AtomSelectorEntry))
+  , mIdSelectors(aQuirksMode ? &AtomSelector_CIOps : &AtomSelector_CSOps,
+                 sizeof(AtomSelectorEntry))
+  ,
+  // mAttributeSelectors is matching on the attribute _name_, not the
+  // value, and we case-fold names at parse-time, so this is a
+  // case-sensitive match.
+  mAttributeSelectors(&AtomSelector_CSOps, sizeof(AtomSelectorEntry))
+  , mAnonBoxRules(&RuleHash::TagTable_Ops, sizeof(RuleHashTagTableEntry))
+  , mXULTreeRules(&RuleHash::TagTable_Ops, sizeof(RuleHashTagTableEntry))
+  , mKeyframesRuleTable()
+  , mCounterStyleRuleTable()
+  , mQuirksMode(aQuirksMode)
+{
+  memset(mPseudoElementRuleHashes, 0, sizeof(mPseudoElementRuleHashes));
+}
+
+RuleCascadeData::~RuleCascadeData()
+{
+  for (uint32_t i = 0; i < ArrayLength(mPseudoElementRuleHashes); ++i) {
+    delete mPseudoElementRuleHashes[i];
+  }
+}
+
+static size_t
+SizeOfSelectorsHashTable(const PLDHashTable& aTable, MallocSizeOf aMallocSizeOf)
+{
+  size_t n = aTable.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (auto iter = aTable.ConstIter(); !iter.Done(); iter.Next()) {
+    auto entry = static_cast<AtomSelectorEntry*>(iter.Get());
+    n += entry->mSelectors.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+  return n;
+}
+
+size_t
+RuleCascadeData::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const
+{
+  size_t n = aMallocSizeOf(this);
+
+  n += mRuleHash.SizeOfExcludingThis(aMallocSizeOf);
+  for (uint32_t i = 0; i < ArrayLength(mPseudoElementRuleHashes); ++i) {
+    if (mPseudoElementRuleHashes[i])
+      n += mPseudoElementRuleHashes[i]->SizeOfIncludingThis(aMallocSizeOf);
+  }
+
+  n += mStateSelectors.ShallowSizeOfExcludingThis(aMallocSizeOf);
+
+  n += SizeOfSelectorsHashTable(mIdSelectors, aMallocSizeOf);
+  n += SizeOfSelectorsHashTable(mClassSelectors, aMallocSizeOf);
+
+  n += mPossiblyNegatedClassSelectors.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  n += mPossiblyNegatedIDSelectors.ShallowSizeOfExcludingThis(aMallocSizeOf);
+
+  n += SizeOfSelectorsHashTable(mAttributeSelectors, aMallocSizeOf);
+  n += SizeOfRuleHashTable(mAnonBoxRules, aMallocSizeOf);
+  n += SizeOfRuleHashTable(mXULTreeRules, aMallocSizeOf);
+
+  n += mFontFaceRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  n += mKeyframesRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  n += mFontFeatureValuesRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  n += mPageRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  n += mCounterStyleRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+
+  n += mKeyframesRuleTable.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (auto iter = mKeyframesRuleTable.ConstIter(); !iter.Done(); iter.Next()) {
+    // We don't own the nsCSSKeyframesRule objects so we don't count them. We
+    // do care about the size of the keys' nsAString members' buffers though.
+    //
+    // Note that we depend on nsStringHashKey::GetKey() returning a reference,
+    // since otherwise aKey would be a copy of the string key and we would not
+    // be measuring the right object here.
+    n += iter.Key().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+  return n;
+}
+
+nsTArray<SelectorPair>*
+RuleCascadeData::AttributeListFor(nsIAtom* aAttribute)
+{
+  auto entry = static_cast<AtomSelectorEntry*>(
+    mAttributeSelectors.Add(aAttribute, fallible));
+  if (!entry) {
+    return nullptr;
+  }
+  return &entry->mSelectors;
+}
+
+void
+RuleCascadeData::RulesMatching(ElementRuleProcessorData* aData)
+{
+  NodeMatchContext nodeContext(EventStates(),
+                                nsCSSRuleUtils::IsLink(aData->mElement),
+                                aData->mElementIsFeatureless);
+  // Test against the assigned slot rather than the slottable if we're
+  // matching the ::slotted() pseudo.
+  Element* targetElement = aData->mElement;
+  if (aData->mTreeMatchContext.mForAssignedSlot) {
+    targetElement = aData->mElement->GetAssignedSlot()->AsElement();
+  }
+  mRuleHash.EnumerateAllRules(targetElement, aData, nodeContext);
+}
+
+void
+RuleCascadeData::RulesMatching(PseudoElementRuleProcessorData* aData)
+{
+  RuleHash* ruleHash =
+    mPseudoElementRuleHashes[static_cast<CSSPseudoElementTypeBase>(
+      aData->mPseudoType)];
+  if (ruleHash) {
+    NodeMatchContext nodeContext(
+      EventStates(), nsCSSRuleUtils::IsLink(aData->mElement));
+    ruleHash->EnumerateAllRules(aData->mElement, aData, nodeContext);
+  }
+}
+
+void
+RuleCascadeData::RulesMatching(AnonBoxRuleProcessorData* aData)
+{
+  if (mAnonBoxRules.EntryCount() == 0) {
+    return;
+  }
+  auto entry = static_cast<RuleHashTagTableEntry*>(
+    mAnonBoxRules.Search(aData->mPseudoTag));
+  if (entry) {
+    nsTArray<RuleValue>& rules = entry->mRules;
+    for (RuleValue *value = rules.Elements(),
+                        *end = value + rules.Length();
+          value != end;
+          ++value) {
+      css::Declaration* declaration = value->mRule->GetDeclaration();
+      declaration->SetImmutable();
+      aData->mRuleWalker->Forward(declaration);
+    }
+  }
+}
+
+void
+RuleCascadeData::RulesMatching(XULTreeRuleProcessorData* aData)
+{
+  if (mXULTreeRules.EntryCount() == 0) {
+    return;
+  }
+  auto entry = static_cast<RuleHashTagTableEntry*>(
+    mXULTreeRules.Search(aData->mPseudoTag));
+  if (entry) {
+    NodeMatchContext nodeContext(
+      EventStates(), nsCSSRuleUtils::IsLink(aData->mElement));
+    nsTArray<RuleValue>& rules = entry->mRules;
+    for (RuleValue *value = rules.Elements(), *end = value + rules.Length();
+          value != end;
+          ++value) {
+      if (aData->mComparator->PseudoMatches(value->mSelector)) {
+        ContentEnumFunc(
+          *value, value->mSelector->mNext, aData, nodeContext, nullptr);
+      }
+    }
+  }
+}
+
+static inline nsRestyleHint
+RestyleHintForOp(char16_t oper)
+{
+  if (oper == char16_t('+') || oper == char16_t('~')) {
+    return eRestyle_LaterSiblings;
+  }
+
+  if (oper != char16_t(0)) {
+    return eRestyle_Subtree;
+  }
+
+  return eRestyle_Self;
+}
+
+/**
+ * Look up the content node in the state rule list, which points to
+ * any (CSS2 definition) simple selector (whether or not it is the
+ * subject) that has a state pseudo-class on it.  This means that this
+ * code will be matching selectors that aren't real selectors in any
+ * stylesheet (e.g., if there is a selector "body > p:hover > a", then
+ * "body > p:hover" will be in |mStateSelectors|).  Note that
+ * |ComputeSelectorStateDependence| determines which selectors are in
+ * |mStateSelectors|.
+ */
+void
+RuleCascadeData::HasStateDependentStyle(
+  ElementDependentRuleProcessorData* aData,
+  Element* aStatefulElement,
+  CSSPseudoElementType aPseudoType,
+  EventStates aStateMask,
+  nsRestyleHint& aHint)
+{
+  bool isPseudoElement = aPseudoType != CSSPseudoElementType::NotPseudo;
+
+  StateSelector *iter = mStateSelectors.Elements(),
+                     *end = iter + mStateSelectors.Length();
+  NodeMatchContext nodeContext(aStateMask, false);
+  for (; iter != end; ++iter) {
+    nsCSSSelector* selector = iter->mSelector;
+    EventStates states = iter->mStates;
+
+    if (selector->IsPseudoElement() != isPseudoElement) {
+      continue;
+    }
+
+    nsCSSSelector* selectorForPseudo;
+    if (isPseudoElement) {
+      if (selector->PseudoType() != aPseudoType) {
+        continue;
+      }
+      selectorForPseudo = selector;
+      selector = selector->mNext;
+    }
+
+    nsRestyleHint possibleChange = RestyleHintForOp(selector->mOperator);
+    SelectorMatchesFlags selectorFlags = SelectorMatchesFlags::UNKNOWN;
+
+    // If hint already includes all the bits of possibleChange,
+    // don't bother calling SelectorMatches, since even if it returns false
+    // hint won't change.
+    // Also don't bother calling SelectorMatches if none of the
+    // states passed in are relevant here.
+    if ((possibleChange & ~aHint) && states.HasAtLeastOneOfStates(aStateMask) &&
+        // We can optimize away testing selectors that only involve :hover, a
+        // namespace, and a tag name against nodes that don't have the
+        // NodeHasRelevantHoverRules flag: such a selector didn't match
+        // the tag name or namespace the first time around (since the :hover
+        // didn't set the NodeHasRelevantHoverRules flag), so it won't
+        // match it now.  Check for our selector only having :hover states, or
+        // the element having the hover rules flag, or the selector having
+        // some sort of non-namespace, non-tagname data in it.
+        (states != NS_EVENT_STATE_HOVER ||
+         aStatefulElement->HasRelevantHoverRules() || selector->mIDList ||
+         selector->mClassList ||
+         // We generally expect an mPseudoClassList, since we have a :hover.
+         // The question is whether we have anything else in there.
+         (selector->mPseudoClassList &&
+          (selector->mPseudoClassList->mNext ||
+           selector->mPseudoClassList->mType != CSSPseudoClassType::hover)) ||
+         selector->mAttrList || selector->mNegations) &&
+        (!isPseudoElement ||
+         nsCSSRuleUtils::StateSelectorMatches(aStatefulElement,
+                                              selectorForPseudo,
+                                              nodeContext,
+                                              aData->mTreeMatchContext,
+                                              selectorFlags,
+                                              nullptr,
+                                              aStateMask)) &&
+        nsCSSRuleUtils::SelectorMatches(aData->mElement,
+                                        selector,
+                                        nodeContext,
+                                        aData->mTreeMatchContext,
+                                        selectorFlags) &&
+        nsCSSRuleUtils::SelectorMatchesTree(
+          aData->mElement,
+          selector->mNext,
+          aData->mTreeMatchContext,
+          eMatchOnConditionalRestyleAncestor)) {
+      aHint = nsRestyleHint(aHint | possibleChange);
+    }
+  }
+}
+
+static inline nsRestyleHint
+RestyleHintForSelectorWithAttributeChange(nsRestyleHint aCurrentHint,
+                                          nsCSSSelector* aSelector,
+                                          nsCSSSelector* aRightmostSelector)
+{
+  MOZ_ASSERT(aSelector);
+
+  char16_t oper = aSelector->mOperator;
+
+  if (oper == char16_t('+') || oper == char16_t('~')) {
+    return eRestyle_LaterSiblings;
+  }
+
+  if (oper == char16_t(':')) {
+    return eRestyle_Subtree;
+  }
+
+  if (oper != char16_t(0)) {
+    // Check whether the selector is in a form that supports
+    // eRestyle_SomeDescendants.  If it isn't, return eRestyle_Subtree.
+
+    if (aCurrentHint & eRestyle_Subtree) {
+      // No point checking, since we'll end up restyling the whole
+      // subtree anyway.
+      return eRestyle_Subtree;
+    }
+
+    if (!aRightmostSelector) {
+      // aSelector wasn't a top-level selector, which means we were inside
+      // a :not() or :-moz-any().  We don't support that.
+      return eRestyle_Subtree;
+    }
+
+    MOZ_ASSERT(aSelector != aRightmostSelector,
+               "if aSelector == aRightmostSelector then we should have "
+               "no operator");
+
+    // Check that aRightmostSelector can be passed to RestrictedSelectorMatches.
+    if (!aRightmostSelector->IsRestrictedSelector()) {
+      return eRestyle_Subtree;
+    }
+
+    // We also don't support pseudo-elements on any of the selectors
+    // between aRightmostSelector and aSelector.
+    // XXX Can we lift this restriction, so that we don't have to loop
+    // over all the selectors?
+    for (nsCSSSelector* sel = aRightmostSelector->mNext; sel != aSelector;
+         sel = sel->mNext) {
+      MOZ_ASSERT(sel, "aSelector must be reachable from aRightmostSelector");
+      if (sel->PseudoType() != CSSPseudoElementType::NotPseudo) {
+        return eRestyle_Subtree;
+      }
+    }
+
+    return eRestyle_SomeDescendants;
+  }
+
+  return eRestyle_Self;
+}
+
+static void
+AttributeEnumFunc(nsCSSSelector* aSelector,
+                  nsCSSSelector* aRightmostSelector,
+                  AttributeEnumData* aData)
+{
+  AttributeRuleProcessorData* data = aData->data;
+
+  if (!data->mTreeMatchContext.SetStyleScopeForSelectorMatching(data->mElement,
+                                                                data->mScope)) {
+    // The selector is for a rule in a scoped style sheet, and the subject
+    // of the selector matching is not in its scope.
+    return;
+  }
+
+  nsRestyleHint possibleChange = RestyleHintForSelectorWithAttributeChange(
+    aData->change, aSelector, aRightmostSelector);
+
+  if (!LookForTargetPseudo(
+        aSelector, &data->mTreeMatchContext, &possibleChange)) {
+    return;
+  }
+
+  // If, ignoring eRestyle_SomeDescendants, enumData->change already includes
+  // all the bits of possibleChange, don't bother calling SelectorMatches, since
+  // even if it returns false enumData->change won't change.  If possibleChange
+  // has eRestyle_SomeDescendants, we need to call SelectorMatches(Tree)
+  // regardless as it might give us new selectors to append to
+  // mSelectorsForDescendants.
+  NodeMatchContext nodeContext(EventStates(), false);
+  if (((possibleChange & (~(aData->change) | eRestyle_SomeDescendants))) &&
+      nsCSSRuleUtils::SelectorMatches(data->mElement,
+                                      aSelector,
+                                      nodeContext,
+                                      data->mTreeMatchContext,
+                                      SelectorMatchesFlags::UNKNOWN) &&
+      nsCSSRuleUtils::SelectorMatchesTree(data->mElement,
+                                          aSelector->mNext,
+                                          data->mTreeMatchContext,
+                                          eMatchOnConditionalRestyleAncestor)) {
+    aData->change = nsRestyleHint(aData->change | possibleChange);
+    if (possibleChange & eRestyle_SomeDescendants) {
+      aData->hintData.mSelectorsForDescendants.AppendElement(
+        aRightmostSelector);
+    }
+  }
+}
+
+static MOZ_ALWAYS_INLINE void
+EnumerateSelectors(nsTArray<SelectorPair>& aSelectors, AttributeEnumData* aData)
+{
+  SelectorPair *iter = aSelectors.Elements(), *end = iter + aSelectors.Length();
+  for (; iter != end; ++iter) {
+    AttributeEnumFunc(iter->mSelector, iter->mRightmostSelector, aData);
+  }
+}
+
+static MOZ_ALWAYS_INLINE void
+EnumerateSelectors(nsTArray<nsCSSSelector*>& aSelectors,
+                   AttributeEnumData* aData)
+{
+  nsCSSSelector **iter = aSelectors.Elements(),
+                **end = iter + aSelectors.Length();
+  for (; iter != end; ++iter) {
+    AttributeEnumFunc(*iter, nullptr, aData);
+  }
+}
+
+void
+RuleCascadeData::HasAttributeDependentStyle(
+  AttributeRuleProcessorData* aData,
+  AttributeEnumData* aEnumData,
+  mozilla::RestyleHintData& aRestyleHintDataResult)
+{
+  // Since we get both before and after notifications for attributes, we
+  // don't have to ignore aData->mAttribute while matching.  Just check
+  // whether we have selectors relevant to aData->mAttribute that we
+  // match.  If this is the before change notification, that will catch
+  // rules we might stop matching; if the after change notification, the
+  // ones we might have started matching.
+
+  if (aData->mAttribute == nsGkAtoms::id) {
+    nsIAtom* id = aData->mElement->GetID();
+    if (id) {
+      auto entry =
+        static_cast<AtomSelectorEntry*>(mIdSelectors.Search(id));
+      if (entry) {
+        EnumerateSelectors(entry->mSelectors, aEnumData);
+      }
+    }
+
+    EnumerateSelectors(mPossiblyNegatedIDSelectors, aEnumData);
+  }
+
+  if (aData->mAttribute == nsGkAtoms::_class &&
+      aData->mNameSpaceID == kNameSpaceID_None) {
+    const nsAttrValue* otherClasses = aData->mOtherValue;
+    NS_ASSERTION(otherClasses ||
+                    aData->mModType == nsIDOMMutationEvent::REMOVAL,
+                  "All class values should be StoresOwnData and parsed"
+                  "via Element::BeforeSetAttr, so available here");
+    // For WillChange, enumerate classes that will be removed to see which
+    // rules apply before the change.
+    // For Changed, enumerate classes that have been added to see which rules
+    // apply after the change.
+    // In both cases we're interested in the classes that are currently on
+    // the element but not in mOtherValue.
+    const nsAttrValue* elementClasses = aData->mElement->GetClasses();
+    if (elementClasses) {
+      int32_t atomCount = elementClasses->GetAtomCount();
+      if (atomCount > 0) {
+        nsTHashtable<nsPtrHashKey<nsIAtom>> otherClassesTable;
+        if (otherClasses) {
+          int32_t otherClassesCount = otherClasses->GetAtomCount();
+          for (int32_t i = 0; i < otherClassesCount; ++i) {
+            otherClassesTable.PutEntry(otherClasses->AtomAt(i));
+          }
+        }
+        for (int32_t i = 0; i < atomCount; ++i) {
+          nsIAtom* curClass = elementClasses->AtomAt(i);
+          if (!otherClassesTable.Contains(curClass)) {
+            auto entry = static_cast<AtomSelectorEntry*>(
+              mClassSelectors.Search(curClass));
+            if (entry) {
+              EnumerateSelectors(entry->mSelectors, aEnumData);
+            }
+          }
+        }
+      }
+    }
+
+    EnumerateSelectors(mPossiblyNegatedClassSelectors, aEnumData);
+  }
+
+  auto entry = static_cast<AtomSelectorEntry*>(
+    mAttributeSelectors.Search(aData->mAttribute));
+  if (entry) {
+    EnumerateSelectors(entry->mSelectors, aEnumData);
+  }
+}
+
+// This function should return the set of states that this selector
+// depends on; this is used to implement HasStateDependentStyle.  It
+// does NOT recur down into things like :not and :-moz-any.
+inline EventStates
+ComputeSelectorStateDependence(nsCSSSelector& aSelector)
+{
+  EventStates states;
+  for (nsPseudoClassList* pseudoClass = aSelector.mPseudoClassList; pseudoClass;
+       pseudoClass = pseudoClass->mNext) {
+    // Tree pseudo-elements overload mPseudoClassList for things that
+    // aren't pseudo-classes.
+    if (pseudoClass->mType >= CSSPseudoClassType::Count) {
+      continue;
+    }
+
+    auto idx = static_cast<CSSPseudoClassTypeBase>(pseudoClass->mType);
+    states |= nsCSSPseudoClasses::sPseudoClassStateDependences[idx];
+  }
+  return states;
+}
+
+bool
+RuleCascadeData::AddSelector(
+  // The part between combinators at the top level of the selector
+  nsCSSSelector* aSelectorInTopLevel,
+  // The part we should look through (might be in :not or :-moz-any())
+  nsCSSSelector* aSelectorPart,
+  // The right-most selector at the top level
+  nsCSSSelector* aRightmostSelector)
+{
+  // It's worth noting that this loop over negations isn't quite
+  // optimal for two reasons.  One, we could add something to one of
+  // these lists twice, which means we'll check it twice, but I don't
+  // think that's worth worrying about.   (We do the same for multiple
+  // attribute selectors on the same attribute.)  Two, we don't really
+  // need to check negations past the first in the current
+  // implementation (and they're rare as well), but that might change
+  // in the future if :not() is extended.
+  for (nsCSSSelector* negation = aSelectorPart; negation;
+       negation = negation->mNegations) {
+    // Track both document states and attribute dependence in pseudo-classes.
+    for (nsPseudoClassList* pseudoClass = negation->mPseudoClassList;
+         pseudoClass;
+         pseudoClass = pseudoClass->mNext) {
+      switch (pseudoClass->mType) {
+        case CSSPseudoClassType::mozLocaleDir: {
+          mSelectorDocumentStates |= NS_DOCUMENT_STATE_RTL_LOCALE;
+          break;
+        }
+        case CSSPseudoClassType::mozWindowInactive: {
+          mSelectorDocumentStates |=
+            NS_DOCUMENT_STATE_WINDOW_INACTIVE;
+          break;
+        }
+        case CSSPseudoClassType::mozTableBorderNonzero: {
+          nsTArray<SelectorPair>* array =
+            AttributeListFor(nsGkAtoms::border);
+          if (!array) {
+            return false;
+          }
+          array->AppendElement(
+            SelectorPair(aSelectorInTopLevel, aRightmostSelector));
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+    }
+
+    // Build mStateSelectors.
+    EventStates dependentStates = ComputeSelectorStateDependence(*negation);
+    if (!dependentStates.IsEmpty()) {
+      mStateSelectors.AppendElement(
+        StateSelector(dependentStates, aSelectorInTopLevel));
+    }
+
+    // Build mIDSelectors
+    if (negation == aSelectorInTopLevel) {
+      for (nsAtomList* curID = negation->mIDList; curID; curID = curID->mNext) {
+        auto entry = static_cast<AtomSelectorEntry*>(
+          mIdSelectors.Add(curID->mAtom, fallible));
+        if (entry) {
+          entry->mSelectors.AppendElement(
+            SelectorPair(aSelectorInTopLevel, aRightmostSelector));
+        }
+      }
+    } else if (negation->mIDList) {
+      mPossiblyNegatedIDSelectors.AppendElement(aSelectorInTopLevel);
+    }
+
+    // Build mClassSelectors
+    if (negation == aSelectorInTopLevel) {
+      for (nsAtomList* curClass = negation->mClassList; curClass;
+           curClass = curClass->mNext) {
+        auto entry = static_cast<AtomSelectorEntry*>(
+          mClassSelectors.Add(curClass->mAtom, fallible));
+        if (entry) {
+          entry->mSelectors.AppendElement(
+            SelectorPair(aSelectorInTopLevel, aRightmostSelector));
+        }
+      }
+    } else if (negation->mClassList) {
+      mPossiblyNegatedClassSelectors.AppendElement(
+        aSelectorInTopLevel);
+    }
+
+    // Build mAttributeSelectors.
+    for (nsAttrSelector* attr = negation->mAttrList; attr; attr = attr->mNext) {
+      nsTArray<SelectorPair>* array = AttributeListFor(attr->mCasedAttr);
+      if (!array) {
+        return false;
+      }
+      array->AppendElement(
+        SelectorPair(aSelectorInTopLevel, aRightmostSelector));
+      if (attr->mLowercaseAttr != attr->mCasedAttr) {
+        array = AttributeListFor(attr->mLowercaseAttr);
+        if (!array) {
+          return false;
+        }
+        array->AppendElement(
+          SelectorPair(aSelectorInTopLevel, aRightmostSelector));
+      }
+    }
+
+    // Recur through any pseudo-class that has a selector list argument.
+    for (nsPseudoClassList* pseudoClass = negation->mPseudoClassList;
+         pseudoClass;
+         pseudoClass = pseudoClass->mNext) {
+      if (nsCSSPseudoClasses::HasSelectorListArg(pseudoClass->mType)) {
+        for (nsCSSSelectorList* l = pseudoClass->u.mSelectorList; l;
+             l = l->mNext) {
+          nsCSSSelector* s = l->mSelectors;
+          if (!AddSelector(aSelectorInTopLevel, s, aRightmostSelector)) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+bool
+RuleCascadeData::AddRule(RuleSelectorPair* aRuleInfo)
+{
+  // Build the rule hash.
+  CSSPseudoElementType pseudoType = aRuleInfo->mSelector->PseudoType();
+  if (MOZ_LIKELY(pseudoType == CSSPseudoElementType::NotPseudo)) {
+    mRuleHash.AppendRule(*aRuleInfo);
+  } else if (pseudoType < CSSPseudoElementType::Count) {
+    RuleHash*& ruleHash =
+      mPseudoElementRuleHashes[static_cast<CSSPseudoElementTypeBase>(
+        pseudoType)];
+    if (!ruleHash) {
+      ruleHash = new RuleHash(mQuirksMode);
+      if (!ruleHash) {
+        // Out of memory; give up
+        return false;
+      }
+    }
+    NS_ASSERTION(aRuleInfo->mSelector->mNext,
+                 "Must have mNext; parser screwed up");
+    NS_ASSERTION(aRuleInfo->mSelector->mNext->mOperator == ':',
+                 "Unexpected mNext combinator");
+    ruleHash->AppendRule(*aRuleInfo);
+  } else if (pseudoType == CSSPseudoElementType::AnonBox) {
+    NS_ASSERTION(
+      !aRuleInfo->mSelector->mCasedTag && !aRuleInfo->mSelector->mIDList &&
+        !aRuleInfo->mSelector->mClassList &&
+        !aRuleInfo->mSelector->mPseudoClassList &&
+        !aRuleInfo->mSelector->mAttrList && !aRuleInfo->mSelector->mNegations &&
+        !aRuleInfo->mSelector->mNext &&
+        aRuleInfo->mSelector->mNameSpace == kNameSpaceID_Unknown,
+      "Parser messed up with anon box selector");
+
+    // Index doesn't matter here, since we'll just be walking these
+    // rules in order; just pass 0.
+    RuleHash::AppendRuleToTagTable(
+      &mAnonBoxRules,
+      aRuleInfo->mSelector->mLowercaseTag,
+      RuleValue(*aRuleInfo, 0, mQuirksMode));
+  } else {
+    NS_ASSERTION(pseudoType == CSSPseudoElementType::XULTree,
+                 "Unexpected pseudo type");
+    // Index doesn't matter here, since we'll just be walking these
+    // rules in order; just pass 0.
+    RuleHash::AppendRuleToTagTable(
+      &mXULTreeRules,
+      aRuleInfo->mSelector->mLowercaseTag,
+      RuleValue(*aRuleInfo, 0, mQuirksMode));
+  }
+
+  for (nsCSSSelector* selector = aRuleInfo->mSelector; selector;
+       selector = selector->mNext) {
+    if (selector->IsPseudoElement()) {
+      CSSPseudoElementType pseudo = selector->PseudoType();
+      if (pseudo >= CSSPseudoElementType::Count ||
+          !nsCSSPseudoElements::PseudoElementSupportsUserActionState(pseudo)) {
+        NS_ASSERTION(!selector->mNegations, "Shouldn't have negations");
+        // We do store selectors ending with pseudo-elements that allow :hover
+        // and :active after them in the hashtables corresponding to that
+        // selector's mNext (i.e. the thing that matches against the element),
+        // but we want to make sure that selectors for any other kinds of
+        // pseudo-elements don't end up in the hashtables.  In particular, tree
+        // pseudos store strange things in mPseudoClassList that we don't want
+        // to try to match elements against.
+        continue;
+      }
+    }
+    if (!AddSelector(selector, selector, aRuleInfo->mSelector)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+struct PerWeightDataListItem : public RuleSelectorPair
+{
+  PerWeightDataListItem(css::StyleRule* aRule, nsCSSSelector* aSelector)
+    : RuleSelectorPair(aRule, aSelector)
+    , mNext(nullptr)
+  {
+  }
+  // No destructor; these are arena-allocated
+
+  // Placement new to arena allocate the PerWeightDataListItem
+  void* operator new(size_t aSize, PLArenaPool& aArena) CPP_THROW_NEW
+  {
+    void* mem;
+    PL_ARENA_ALLOCATE(mem, &aArena, aSize);
+    return mem;
+  }
+
+  PerWeightDataListItem* mNext;
+};
+
+struct PerWeightData
+{
+  PerWeightData()
+    : mRuleSelectorPairs(nullptr)
+    , mTail(&mRuleSelectorPairs)
+  {
+  }
+
+  int32_t mWeight;
+  PerWeightDataListItem* mRuleSelectorPairs;
+  PerWeightDataListItem** mTail;
+};
+
+struct RuleByWeightEntry : public PLDHashEntryHdr
+{
+  PerWeightData data; // mWeight is key, mRuleSelectorPairs are value
+};
+
+static PLDHashNumber
+HashIntKey(const void* key)
+{
+  return PLDHashNumber(NS_PTR_TO_INT32(key));
+}
+
+static bool
+MatchWeightEntry(const PLDHashEntryHdr* hdr, const void* key)
+{
+  const RuleByWeightEntry* entry = (const RuleByWeightEntry*)hdr;
+  return entry->data.mWeight == NS_PTR_TO_INT32(key);
+}
+
+static void
+InitWeightEntry(PLDHashEntryHdr* hdr, const void* key)
+{
+  RuleByWeightEntry* entry = static_cast<RuleByWeightEntry*>(hdr);
+  new (KnownNotNull, entry) RuleByWeightEntry();
+}
+
+/* static */ const PLDHashTableOps
+CascadeLayer::WeightedRuleData::sRulesByWeightOps = {
+  HashIntKey,
+  MatchWeightEntry,
+  PLDHashTable::MoveEntryStub,
+  PLDHashTable::ClearEntryStub,
+  InitWeightEntry
+};
+
+CascadeLayer::WeightedRuleData::WeightedRuleData()
+  : mRulesByWeight(&sRulesByWeightOps, sizeof(RuleByWeightEntry), 32)
+{
+  // Initialize our arena
+  PL_INIT_ARENA_POOL(
+    &mArena, "WeightedRuleDataArena", NS_WEIGHTEDRULEDATA_ARENA_BLOCK_SIZE);
+}
+
+CascadeLayer::WeightedRuleData::~WeightedRuleData()
+{
+  PL_FinishArenaPool(&mArena);
+}
+
+static int
+CompareWeightData(const void* aArg1, const void* aArg2, void* closure)
+{
+  const PerWeightData* arg1 = static_cast<const PerWeightData*>(aArg1);
+  const PerWeightData* arg2 = static_cast<const PerWeightData*>(aArg2);
+  return arg1->mWeight - arg2->mWeight; // put lower weight first
+}
+
+UniquePtr<PerWeightData[]>
+CascadeLayer::WeightedRuleData::Consume(nsTArray<css::StyleRule*>& aStyleRules)
+{
+  for (css::StyleRule* styleRule : aStyleRules) {
+    for (nsCSSSelectorList* sel = styleRule->Selector(); sel;
+         sel = sel->mNext) {
+      int32_t weight = sel->mWeight;
+      auto entry = static_cast<RuleByWeightEntry*>(
+        mRulesByWeight.Add(NS_INT32_TO_PTR(weight), fallible));
+      if (!entry) {
+        return nullptr;
+      }
+      entry->data.mWeight = weight;
+      // entry->data.mRuleSelectorPairs should be linked in forward order;
+      // entry->data.mTail is the slot to write to.
+      auto* newItem =
+        new (mArena) PerWeightDataListItem(styleRule, sel->mSelectors);
+      if (newItem) {
+        *(entry->data.mTail) = newItem;
+        entry->data.mTail = &newItem->mNext;
+      }
+    }
+  }
+
+  // There's no point in keeping pointers to the style rules around
+  // after we've consumed them, so clear the array.
+  aStyleRules.Clear();
+
+  // Sort the hash table of per-weight linked lists by weight.
+  uint32_t weightCount = mRulesByWeight.EntryCount();
+  auto weightArray = MakeUnique<PerWeightData[]>(weightCount);
+  int32_t j = 0;
+  for (auto iter = mRulesByWeight.Iter(); !iter.Done(); iter.Next()) {
+    auto entry = static_cast<const RuleByWeightEntry*>(iter.Get());
+    weightArray[j++] = entry->data;
+  }
+  NS_QuickSort(weightArray.get(),
+               weightCount,
+               sizeof(PerWeightData),
+               CompareWeightData,
+               nullptr);
+
+  return weightArray;
+}
+
+CascadeLayer::CascadeLayer(nsPresContext* aPresContext,
+#ifdef DEBUG
+                           CascadeLayer* aParent,
+#endif
+                           nsTArray<css::DocumentRule*>& aDocumentRules,
+                           nsDocumentRuleResultCacheKey& aDocumentKey,
+                           SheetType aSheetType,
+                           bool aMustGatherDocumentRules,
+                           nsMediaQueryResultCacheKey& aCacheKey)
+  : mPresContext(aPresContext)
+  , mIsAnonymous(true)
+#ifdef DEBUG
+  , mIsStrong(false)
+#endif
+  , mRulesAdded(false)
+#ifdef DEBUG
+  , mParent(aParent)
+#endif
+  , mDocumentRules(aDocumentRules)
+  , mDocumentCacheKey(aDocumentKey)
+  , mSheetType(aSheetType)
+  , mMustGatherDocumentRules(aMustGatherDocumentRules)
+  , mCacheKey(aCacheKey)
+{
+  mData = new RuleCascadeData(eCompatibility_NavQuirks ==
+                              mPresContext->CompatibilityMode());
+}
+
+CascadeLayer::~CascadeLayer()
+{
+  delete mData;
+}
+
+size_t
+CascadeLayer::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const
+{
+  size_t n = aMallocSizeOf(this);
+  if (mData) {
+    n += mData->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  n += mName.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  n += mStyleRules.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  // While we do create the child layers, they are not owned by us, so we
+  // don't count them. Their ownership is managed by the rule processor
+  // to which they are eventually attached (see nsCSSRuleProcessor).
+  n += mPreLayers.ShallowSizeOfExcludingThis(aMallocSizeOf);
+#ifdef DEBUG
+  n += mPostLayers.ShallowSizeOfExcludingThis(aMallocSizeOf);
+#endif
+  n += mLayers.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (auto iter = mLayers.ConstIter(); !iter.Done(); iter.Next()) {
+    // We don't own the CascadeLayer objects so we don't count them. We
+    // do care about the size of the keys' nsAString members' buffers though.
+    //
+    // Note that we depend on nsStringHashKey::GetKey() returning a reference,
+    // since otherwise aKey would be a copy of the string key and we would not
+    // be measuring the right object here.
+    n += iter.Key().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+  return n;
+}
+
+CascadeLayer*
+CascadeLayer::CreateNamedChildLayer(const nsTArray<nsString>& aPath)
+{
+  if (aPath.IsEmpty()) {
+    return this;
+  }
+
+  const nsString& name = aPath[0];
+  CascadeLayer* childLayer = nullptr;
+
+  // Create new layer if it doesn't exist.
+  if (!mLayers.Get(name, &childLayer)) {
+    childLayer = new CascadeLayer(mPresContext,
+#ifdef DEBUG
+                                  this,
+#endif
+                                  mDocumentRules,
+                                  mDocumentCacheKey,
+                                  mSheetType,
+                                  mMustGatherDocumentRules,
+                                  mCacheKey);
+    childLayer->mName = name;
+    childLayer->mIsAnonymous = false;
+    mPreLayers.AppendElement(childLayer);
+    mLayers.Put(name, childLayer);
+  }
+
+  // Final layer in the path.
+  if (aPath.Length() == 1) {
+    return childLayer;
+  }
+
+  // Continue with the tail of the path.
+  nsTArray<nsString> tail;
+  tail.AppendElements(aPath.Elements() + 1, aPath.Length() - 1);
+  return childLayer->CreateNamedChildLayer(tail);
+}
+
+CascadeLayer*
+CascadeLayer::CreateAnonymousChildLayer()
+{
+  CascadeLayer* childLayer = new CascadeLayer(mPresContext,
+#ifdef DEBUG
+                                              this,
+#endif
+                                              mDocumentRules,
+                                              mDocumentCacheKey,
+                                              mSheetType,
+                                              mMustGatherDocumentRules,
+                                              mCacheKey);
+  mPreLayers.AppendElement(childLayer);
+  return childLayer;
+}
+
+void
+CascadeLayer::AddRules()
+{
+  MOZ_ASSERT(!mRulesAdded, "Rule cascade data already filled");
+
+  WeightedRuleData ruleData;
+  auto weightArray = ruleData.Consume(mStyleRules);
+
+  // Put things into the rule hash.
+  // The primary sort is by weight...
+  for (uint32_t i = 0; i < ruleData.mRulesByWeight.EntryCount(); ++i) {
+    // and the secondary sort is by order.  mRuleSelectorPairs is already in
+    // the right order..
+    for (PerWeightDataListItem* cur = weightArray[i].mRuleSelectorPairs; cur;
+         cur = cur->mNext) {
+      if (!mData->AddRule(cur)) {
+        return; /* out of memory */
+      }
+    }
+  }
+
+  // Build mKeyframesRuleTable.
+  for (nsTArray<nsCSSKeyframesRule*>::size_type
+         i = 0,
+         iEnd = mData->mKeyframesRules.Length();
+       i < iEnd;
+       ++i) {
+    nsCSSKeyframesRule* rule = mData->mKeyframesRules[i];
+    mData->mKeyframesRuleTable.Put(rule->GetName(), rule);
+  }
+
+  // Build mCounterStyleRuleTable
+  for (nsTArray<nsCSSCounterStyleRule*>::size_type
+         i = 0,
+         iEnd = mData->mCounterStyleRules.Length();
+       i < iEnd;
+       ++i) {
+    nsCSSCounterStyleRule* rule = mData->mCounterStyleRules[i];
+    mData->mCounterStyleRuleTable.Put(rule->GetName(), rule);
+  }
+
+  mRulesAdded = true;
+}
+
+void
+CascadeLayer::EnumerateAllLayers(nsLayerEnumFunc aFunc, void* aData)
+{
+  if (mPreLayers.Length() > 0) {
+    for (CascadeLayer* pre : mPreLayers) {
+      pre->EnumerateAllLayers(aFunc, aData);
+    }
+  }
+
+  (*aFunc)(this, aData);
+
+#ifdef DEBUG
+  if (mPostLayers.Length() > 0) {
+    for (CascadeLayer* post : mPostLayers) {
+      post->EnumerateAllLayers(aFunc, aData);
+    }
+  }
+#endif
+}
