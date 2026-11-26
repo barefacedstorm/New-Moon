@@ -87,6 +87,17 @@ Copy `libwgpu_native.so` and `libwasmtime.so` next to `palemoon` and `libxul.so`
 
 ---
 
+## Windows Installer (`.msi`) & Windows Defender Notes
+
+- **Why MSI (instead of a packed `.exe`)**: This repository includes a standard **WiX v4 Windows Installer (`.msi`)** definition (`installer/windows/NewMoon.wxs`) and a GitHub Actions workflow (`.github/workflows/windows-installer.yml`) that builds `NewMoon-35.1.0-win64.msi` natively on Windows x64 alongside `SHA256SUMS.txt`. Using a clean, standard MSI without UPX packing or custom self-extracting stubs minimizes Windows Defender heuristic false positives.
+- **How to build/download the Windows `.msi`**:
+  1. Push this repo to GitHub, then open **Actions → Build Windows MSI Installer → Run workflow** (or push a tag like `v35.1.0`).
+  2. Download the `NewMoon-win64-msi` artifact (`NewMoon-35.1.0-win64.msi` + `SHA256SUMS.txt`) and attach it to a GitHub Release.
+  *(Note: Binary installers are published via GitHub Releases/Actions rather than committed directly into Git, and `platform/dom/quota/OPFS.cpp` may require porting its POSIX `pread`/`pwrite`/`dirent` calls to Win32 file APIs before a Windows MSVC build completes.)*
+- **Windows SmartScreen / Defender**: Because community builds are not signed with a commercial Authenticode code-signing certificate, Windows SmartScreen may show *"Windows protected your PC"* on first run. Users can verify the file against `SHA256SUMS.txt` (`certutil -hashfile NewMoon-35.1.0-win64.msi SHA256`), then click **More info → Run anyway**. To eliminate SmartScreen prompts for end users, sign the `.msi` and `palemoon.exe` in CI using a valid Authenticode certificate or Azure Trusted Signing.
+
+---
+
 ## License & Attribution
 
 - Based on **Pale Moon 35.1.0** and the **Unified XUL Platform (UXP)**, licensed under the **Mozilla Public License 2.0 (MPL-2.0)** (see `LICENSE`).

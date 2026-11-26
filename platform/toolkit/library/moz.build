@@ -307,13 +307,19 @@ if CONFIG['COMPILE_ENVIRONMENT']:
     FINAL_TARGET_FILES += ['!dependentlibs.list']
 
 # Link wgpu-native (WebGPU) and wasmtime (WebAssembly 2.0+ SIMD/Threads)
-OS_LIBS += [
-    '-L/home/barefaced/palemoon-wgpu-native/lib',
-    '-L/home/barefaced/palemoon-wasmtime/lib',
-    '-Wl,-rpath,\\$$ORIGIN:/home/barefaced/palemoon-wgpu-native/lib:/home/barefaced/palemoon-wasmtime/lib',
-    '-lwgpu_native',
-    '-lwasmtime',
-]
+if CONFIG['OS_ARCH'] == 'WINNT':
+    OS_LIBS += [
+        'wgpu_native.dll',
+        'wasmtime.dll',
+    ]
+else:
+    OS_LIBS += [
+        '-L/home/barefaced/palemoon-wgpu-native/lib',
+        '-L/home/barefaced/palemoon-wasmtime/lib',
+        '-Wl,-rpath,\\$$ORIGIN:/home/barefaced/palemoon-wgpu-native/lib:/home/barefaced/palemoon-wasmtime/lib',
+        '-lwgpu_native',
+        '-lwasmtime',
+    ]
 
 # This library needs to be last to make XPCOM module registration work.
 USE_LIBS += ['StaticXULComponentsEnd']

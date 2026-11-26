@@ -17,9 +17,13 @@
 #include "vm/GlobalObject.h"
 #include "vm/SharedArrayObject.h"
 
+#if defined(__GNUC__)
 #pragma GCC visibility push(default)
+#endif
 #include <wasmtime.h>
+#if defined(__GNUC__)
 #pragma GCC visibility pop
+#endif
 
 #include <atomic>
 #include <cstring>

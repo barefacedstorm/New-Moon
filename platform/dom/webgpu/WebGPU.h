@@ -20,10 +20,14 @@
 #include "nsTArray.h"
 #include "nsWrapperCache.h"
 
+#if defined(__GNUC__)
 #pragma GCC visibility push(default)
+#endif
 #include "webgpu/webgpu.h"
 #include "webgpu/wgpu.h"
+#if defined(__GNUC__)
 #pragma GCC visibility pop
+#endif
 
 namespace mozilla {
 namespace layers {

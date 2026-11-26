@@ -1,0 +1,71 @@
+name: Build Windows MSI Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-win64-msi:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download wgpu-native v29.0.1.1 (Windows x86_64 MSVC)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\wgpu-native" | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-msvc-release.zip" -OutFile wgpu.zip
+          Expand-Archive -Path wgpu.zip -DestinationPath "$env:USERPROFILE\wgpu-native" -Force
+
+      - name: Download wasmtime v51.0.0 C API (Windows x86_64 MSVC)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\wasmtime" | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-windows-c-api.zip" -OutFile wasmtime.zip
+          Expand-Archive -Path wasmtime.zip -DestinationPath "$env:USERPROFILE\wasmtime" -Force
+
+      - name: Install MozillaBuild & WiX v4
+        shell: pwsh
+        run: |
+          choco install -y mozillabuild
+          dotnet tool install --global wix
+
+      - name: Configure and Build New Moon (Win64)
+        shell: pwsh
+        env:
+          MOZCONFIG: ${{ github.workspace }}\.mozconfig-win64
+        run: |
+          $wgpuLib = "$env:USERPROFILE\wgpu-native\lib"
+          $wasmLib = (Get-ChildItem -Path "$env:USERPROFILE\wasmtime" -Directory | Select-Object -First 1).FullName + "\lib"
+          $env:LIB = "$wgpuLib;$wasmLib;$env:LIB"
+          C:\mozilla-build\msys\bin\bash.exe -lc "cd '$($env:GITHUB_WORKSPACE -replace '\\','/')' && ./mach build && ./mach package"
+
+      - name: Stage Windows Bundle + DLLs
+        shell: pwsh
+        run: |
+          $stage = "$env:GITHUB_WORKSPACE\dist-win64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $zip = Get-ChildItem -Path "obj-newmoon-win64\dist\*.zip" | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath $stage -Force
+          $appDir = (Get-ChildItem -Path $stage -Directory | Select-Object -First 1).FullName
+          Copy-Item "$env:USERPROFILE\wgpu-native\lib\wgpu_native.dll" -Destination $appDir
+          $wasmLib = (Get-ChildItem -Path "$env:USERPROFILE\wasmtime" -Directory | Select-Object -First 1).FullName + "\lib"
+          Copy-Item "$wasmLib\wasmtime.dll" -Destination $appDir
+          echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
+
+      - name: Build Standard MSI Installer (WiX v4)
+        shell: pwsh
+        run: |
+          wix build installer/windows/NewMoon.wxs -d SourceDir="$env:APP_DIR" -o NewMoon-35.1.0-win64.msi
+          Get-FileHash NewMoon-35.1.0-win64.msi -Algorithm SHA256 | Format-List > SHA256SUMS.txt
+
+      - name: Upload Windows MSI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NewMoon-win64-msi
+          path: |
+            NewMoon-35.1.0-win64.msi
+            SHA256SUMS.txt
