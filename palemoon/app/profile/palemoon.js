@@ -1178,8 +1178,8 @@ pref("toolkit.startup.max_resumed_crashes", 3);
 
 // The maximum amount of decoded image data we'll willingly keep around (we
 // might keep around more than this, but we'll try to get down to this value).
-// (This is intentionally on the high side; see bug 746055.)
-pref("image.mem.max_decoded_image_kb", 256000);
+// Tuned for low-RAM / older hardware in New Moon.
+pref("image.mem.max_decoded_image_kb", 65536);
 
 // Turn on the CSP 1.0 parser for Content Security Policy headers
 pref("security.csp.speccompliant", true);
@@ -1278,3 +1278,28 @@ pref("status4evar.status.toolbar.maxLength", 0);
 
 pref("status4evar.status.popup.invertMirror", false);
 pref("status4evar.status.popup.mouseMirror", true);
+
+// ****************** New Moon Security, Privacy & Low-Resource Defaults ******************
+// Commercial-grade privacy & security defaults (zero CPU/RAM overhead)
+pref("network.http.referer.XOriginTrimmingPolicy", 2); // strict-origin-when-cross-origin
+pref("network.IDN.restriction_profile", "high");       // IDN homograph protection
+pref("media.peerconnection.ice.default_address_only", true);
+pref("media.peerconnection.ice.no_host", true);        // prevent LAN IP leaks via WebRTC
+pref("security.mixed_content.block_active_content", true);
+pref("security.mixed_content.send_hsts_priming", true);
+pref("security.mixed_content.use_hsts", true);
+
+// Aggressive memory reclamation & old-hardware resource caps
+pref("memory.free_dirty_pages", true);                 // purge jemalloc dirty pages back to OS
+pref("browser.sessionhistory.max_total_viewers", 2);   // cap bfcache DOM trees in RAM
+pref("browser.cache.memory.capacity", 32768);          // 32 MiB memory cache cap
+pref("image.mem.surfacecache.max_size_kb", 131072);    // 128 MiB image surface cache cap (down from 1 GiB)
+pref("image.mem.surfacecache.min_expiration_ms", 60000); // expire unused decoded images after 60s
+pref("javascript.options.mem.high_water_mark", 64);
+pref("javascript.options.mem.gc_max_empty_chunk_count", 6);
+pref("javascript.options.mem.gc_high_frequency_high_limit_mb", 256);
+pref("javascript.options.mem.gc_high_frequency_heap_growth_max", 200);
+
+// Background tab CPU throttling
+pref("dom.min_background_timeout_value", 1000);
+pref("dom.timeout.throttling_delay", 10000);

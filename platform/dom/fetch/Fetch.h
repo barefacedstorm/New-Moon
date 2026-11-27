@@ -92,6 +92,7 @@ enum FetchConsumeType
 {
   CONSUME_ARRAYBUFFER,
   CONSUME_BLOB,
+  CONSUME_BYTES,
   CONSUME_FORMDATA,
   CONSUME_JSON,
   CONSUME_TEXT,
@@ -162,6 +163,12 @@ public:
   Blob(JSContext* aCx, ErrorResult& aRv)
   {
     return ConsumeBody(aCx, CONSUME_BLOB, aRv);
+  }
+
+  already_AddRefed<Promise>
+  Bytes(JSContext* aCx, ErrorResult& aRv)
+  {
+    return ConsumeBody(aCx, CONSUME_BYTES, aRv);
   }
 
   already_AddRefed<Promise>

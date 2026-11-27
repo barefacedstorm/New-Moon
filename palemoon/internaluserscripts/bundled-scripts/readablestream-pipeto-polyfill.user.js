@@ -63,7 +63,13 @@
 
     var source = this;
     var reader = source.getReader();
+    if (reader && reader.closed && typeof reader.closed.catch === "function") {
+      reader.closed.catch(function () {});
+    }
     var writer = writable.getWriter();
+    if (writer && writer.closed && typeof writer.closed.catch === "function") {
+      writer.closed.catch(function () {});
+    }
     var preventClose = options && options.preventClose;
     var preventAbort = options && options.preventAbort;
     var preventCancel = options && options.preventCancel;
@@ -99,6 +105,11 @@
       }
       if (typeof releaseFn === "function") {
         try { releaseFn.call(maybeReader); } catch (e) {}
+        try {
+          if (maybeReader.closed && typeof maybeReader.closed.catch === "function") {
+            maybeReader.closed.catch(function () {});
+          }
+        } catch (e) {}
       }
     }
 

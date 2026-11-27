@@ -7,9 +7,43 @@
 
 #include "mozilla/dom/Event.h"
 #include "mozilla/dom/AbortSignalBinding.h"
+#include "nsComponentManagerUtils.h"
+#include "nsITimer.h"
 
 namespace mozilla {
 namespace dom {
+
+namespace {
+
+class AbortTimeoutCallback final : public nsITimerCallback
+{
+public:
+  NS_DECL_ISUPPORTS
+
+  AbortTimeoutCallback(AbortSignal* aSignal, nsITimer* aTimer)
+    : mSignal(aSignal)
+    , mTimer(aTimer)
+  {}
+
+  NS_IMETHOD Notify(nsITimer* aTimer) override
+  {
+    mTimer = nullptr;
+    RefPtr<AbortSignal> signal = mSignal.forget();
+    if (signal) {
+      signal->Abort();
+    }
+    return NS_OK;
+  }
+
+private:
+  ~AbortTimeoutCallback() = default;
+  RefPtr<AbortSignal> mSignal;
+  nsCOMPtr<nsITimer> mTimer;
+};
+
+NS_IMPL_ISUPPORTS(AbortTimeoutCallback, nsITimerCallback)
+
+} // anonymous namespace
 
 NS_IMPL_CYCLE_COLLECTION_CLASS(AbortSignal)
 
@@ -51,10 +85,20 @@ already_AddRefed<AbortSignal> AbortSignal::Abort(GlobalObject& aGlobal) {
 
 already_AddRefed<AbortSignal> AbortSignal::Timeout(GlobalObject& aGlobal, uint64_t aMilliseconds) {
   nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
-  
-  // Stub implementation, just return an AbortSignal object
   RefPtr<AbortSignal> abortSignal = new AbortSignal(global, false);
-  
+
+  nsCOMPtr<nsITimer> timer = do_CreateInstance(NS_TIMER_CONTRACTID);
+  if (timer) {
+    uint32_t delay = aMilliseconds > UINT32_MAX
+                       ? UINT32_MAX
+                       : static_cast<uint32_t>(aMilliseconds);
+    RefPtr<AbortTimeoutCallback> cb = new AbortTimeoutCallback(abortSignal, timer);
+    if (NS_FAILED(timer->InitWithCallback(cb, delay, nsITimer::TYPE_ONE_SHOT))) {
+      // Clear timer ref if scheduling failed so callback isn't leaked.
+      cb->Notify(nullptr);
+    }
+  }
+
   return abortSignal.forget();
 }
 
@@ -70,6 +114,10 @@ AbortSignal::Any(GlobalObject& aGlobal,
     }
   }
   RefPtr<AbortSignal> composite = new AbortSignal(global, false);
+  for (uint32_t i = 0; i < aSignals.Length(); ++i) {
+    composite->mCompositeFollowers.AppendElement(
+      MakeUnique<CompositeFollower>(composite, aSignals[i]));
+  }
   return composite.forget();
 }
 
@@ -100,9 +148,15 @@ AbortSignal::Abort()
   // stay alive until all followers have been aborted.
   RefPtr<AbortSignal> pinThis = this;
 
-  // Let's inform the followers.
-  for (uint32_t i = 0; i < mFollowers.Length(); ++i) {
-    mFollowers[i]->Aborted();
+  // Release any source signal subscriptions now that we are aborted.
+  mCompositeFollowers.Clear();
+
+  // Let's inform the followers. Swap out mFollowers so re-entrant
+  // RemoveFollower() calls (e.g. from CompositeFollower) cannot skip entries.
+  nsTArray<Follower*> followers;
+  followers.SwapElements(mFollowers);
+  for (uint32_t i = 0; i < followers.Length(); ++i) {
+    followers[i]->Aborted();
   }
 
   EventInit init;

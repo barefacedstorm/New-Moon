@@ -272,6 +272,18 @@ InternalUserscriptsService.prototype = {
     } catch (e) {
       // ignore
     }
+
+    try {
+      Services.scriptloader.loadSubScript(
+        "chrome://internaluserscripts/content/bundled-scripts/es2025-polyfill.user.js",
+        contentWin,
+      );
+      if (contentWin.__internalUserscriptsES2025Polyfill) {
+        logPolyfill("ES2025+ Standard Library", "bundled");
+      }
+    } catch (e) {
+      // ignore
+    }
   },
 };
 

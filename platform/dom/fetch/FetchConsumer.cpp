@@ -581,6 +581,17 @@ FetchBodyConsumer<Derived>::ContinueConsumeBody(nsresult aStatus,
       MOZ_CRASH("This should not happen.");
       break;
     }
+    case CONSUME_BYTES: {
+      JS::Rooted<JSObject*> uint8Array(cx,
+        Uint8Array::Create(cx, aResultLength, aResult));
+      if (!uint8Array) {
+        error.Throw(NS_ERROR_OUT_OF_MEMORY);
+      } else {
+        JS::Rooted<JS::Value> val(cx, JS::ObjectValue(*uint8Array));
+        localPromise->MaybeResolve(cx, val);
+      }
+      break;
+    }
     case CONSUME_FORMDATA: {
       nsCString data;
       data.Adopt(reinterpret_cast<char*>(aResult), aResultLength);

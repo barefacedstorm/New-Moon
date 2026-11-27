@@ -2,15 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-pref("security.tls.version.min", 1);
+pref("security.tls.version.min", 3);
 pref("security.tls.version.max", 4);
 pref("security.tls.version.fallback-limit", 3);
 pref("security.tls.insecure_fallback_hosts", "");
 pref("security.tls.unrestricted_rc4_fallback", false);
 pref("security.tls.enable_0rtt_data", false);
 
-pref("security.ssl.treat_unsafe_negotiation_as_broken", false);
-pref("security.ssl.require_safe_negotiation",  false);
+pref("security.ssl.treat_unsafe_negotiation_as_broken", true);
+pref("security.ssl.require_safe_negotiation",  true);
 pref("security.ssl.enable_ocsp_stapling", true);
 pref("security.ssl.enable_false_start", true);
 pref("security.ssl.enable_alpn", true);
@@ -20,7 +20,7 @@ pref("security.tls13.aes_128_gcm_sha256", true);
 pref("security.tls13.chacha20_poly1305_sha256", true);
 pref("security.tls13.aes_256_gcm_sha384", true);
 
-// TLS 1.0-1.2 cipher suites
+// TLS 1.2 cipher suites (PFS ECDHE only)
 pref("security.ssl3.ecdhe_rsa_aes_128_gcm_sha256", true);
 pref("security.ssl3.ecdhe_ecdsa_aes_128_gcm_sha256", true);
 pref("security.ssl3.ecdhe_ecdsa_chacha20_poly1305_sha256", true);
@@ -31,14 +31,16 @@ pref("security.ssl3.ecdhe_rsa_aes_128_sha", true);
 pref("security.ssl3.ecdhe_ecdsa_aes_128_sha", true);
 pref("security.ssl3.ecdhe_rsa_aes_256_sha", true);
 pref("security.ssl3.ecdhe_ecdsa_aes_256_sha", true);
-pref("security.ssl3.dhe_rsa_camellia_256_sha", true);
-pref("security.ssl3.dhe_rsa_camellia_128_sha", true);
-pref("security.ssl3.rsa_aes_256_gcm_sha384", true);
-pref("security.ssl3.rsa_aes_256_sha256", true);
-pref("security.ssl3.rsa_camellia_128_sha", true);
-pref("security.ssl3.rsa_camellia_256_sha", true);
-pref("security.ssl3.rsa_aes_128_sha", true);
-pref("security.ssl3.rsa_aes_256_sha", true);
+
+// Legacy non-PFS RSA & Camellia cipher suites (disabled for commercial-grade TLS parity)
+pref("security.ssl3.dhe_rsa_camellia_256_sha", false);
+pref("security.ssl3.dhe_rsa_camellia_128_sha", false);
+pref("security.ssl3.rsa_aes_256_gcm_sha384", false);
+pref("security.ssl3.rsa_aes_256_sha256", false);
+pref("security.ssl3.rsa_camellia_128_sha", false);
+pref("security.ssl3.rsa_camellia_256_sha", false);
+pref("security.ssl3.rsa_aes_128_sha", false);
+pref("security.ssl3.rsa_aes_256_sha", false);
 
 // Deprecated
 pref("security.ssl3.dhe_rsa_aes_256_sha", false);
@@ -88,7 +90,7 @@ pref("security.pki.sha1_enforcement_level", 3);
 // 2: fall back to the subject common name for certificates valid before 23
 //    August 2015 if necessary
 // 3: only use name information from the subject alternative name extension
-pref("security.pki.name_matching_mode", 1);
+pref("security.pki.name_matching_mode", 3);
 
 // security.pki.netscape_step_up_policy controls how the platform handles the
 // id-Netscape-stepUp OID in extended key usage extensions of CA certificates.
@@ -96,7 +98,7 @@ pref("security.pki.name_matching_mode", 1);
 // 1: it is considered equivalent when the notBefore is before 23 August 2016
 // 2: similarly, but for 23 August 2015
 // 3: it is never considered equivalent
-pref("security.pki.netscape_step_up_policy", 1);
+pref("security.pki.netscape_step_up_policy", 3);
 
 // Configures Certificate Transparency support mode:
 // 0: Fully disabled.
@@ -129,4 +131,4 @@ pref("security.tls.hello_downgrade_check", true);
 // see if it is available over HTTPS.
 pref("security.mixed_content.send_hsts_priming", true);
 // Don't change the order of evaluation of mixed-content and HSTS upgrades
-pref("security.mixed_content.use_hsts", false);
+pref("security.mixed_content.use_hsts", true);

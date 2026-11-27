@@ -89,6 +89,73 @@ Response::Error(const GlobalObject& aGlobal)
   return r.forget();
 }
 
+namespace {
+
+bool
+WriteResponseJSONCallback(const char16_t* aBuf, uint32_t aLen, void* aData)
+{
+  static_cast<nsAString*>(aData)->Append(aBuf, aLen);
+  return true;
+}
+
+} // anonymous namespace
+
+/* static */ already_AddRefed<Response>
+Response::Json(const GlobalObject& aGlobal,
+               JSContext* aCx,
+               JS::Handle<JS::Value> aData,
+               const ResponseInit& aInit,
+               ErrorResult& aRv)
+{
+  JSContext* cx = aCx;
+  JS::Rooted<JS::Value> val(cx, aData);
+  if (val.isUndefined() || val.isSymbol()) {
+    aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+    return nullptr;
+  }
+  nsString jsonStr;
+  if (!JS_Stringify(cx, &val, nullptr, JS::NullHandleValue,
+                    WriteResponseJSONCallback, &jsonStr)) {
+    aRv.NoteJSContextException(cx);
+    return nullptr;
+  }
+  if (jsonStr.IsEmpty()) {
+    aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+    return nullptr;
+  }
+  if (aInit.mStatus == 204 || aInit.mStatus == 205 || aInit.mStatus == 304) {
+    aRv.ThrowTypeError<MSG_RESPONSE_NULL_STATUS_WITH_BODY>();
+    return nullptr;
+  }
+
+  Optional<fetch::ResponseBodyInit> emptyBody;
+  RefPtr<Response> r = Response::Constructor(aGlobal, emptyBody, aInit, aRv);
+  if (aRv.Failed() || !r) {
+    return nullptr;
+  }
+
+  if (!r->GetInternalHeaders()->Has(NS_LITERAL_CSTRING("content-type"), aRv)) {
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+    r->GetInternalHeaders()->Set(NS_LITERAL_CSTRING("content-type"),
+                                 NS_LITERAL_CSTRING("application/json"), aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  }
+
+  NS_ConvertUTF16toUTF8 utf8(jsonStr);
+  nsCOMPtr<nsIInputStream> bodyStream;
+  nsresult rv = NS_NewCStringInputStream(getter_AddRefs(bodyStream), utf8);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return nullptr;
+  }
+  r->SetBody(bodyStream, utf8.Length());
+  return r.forget();
+}
+
 /* static */ already_AddRefed<Response>
 Response::Redirect(const GlobalObject& aGlobal, const nsAString& aUrl,
                    uint16_t aStatus, ErrorResult& aRv)

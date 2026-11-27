@@ -106,12 +106,17 @@ public:
   GetBody(nsIInputStream** aStream) { return mInternalResponse->GetBody(aStream); }
 
   using FetchBody::GetBody;
+  using FetchBody::Json;
 
   static already_AddRefed<Response>
   Error(const GlobalObject& aGlobal);
 
   static already_AddRefed<Response>
   Redirect(const GlobalObject& aGlobal, const nsAString& aUrl, uint16_t aStatus, ErrorResult& aRv);
+
+  static already_AddRefed<Response>
+  Json(const GlobalObject& aGlobal, JSContext* aCx, JS::Handle<JS::Value> aData,
+       const ResponseInit& aInit, ErrorResult& aRv);
 
   static already_AddRefed<Response>
   Constructor(const GlobalObject& aGlobal,

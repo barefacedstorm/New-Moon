@@ -7,6 +7,7 @@
 #define mozilla_dom_AbortSignal_h
 
 #include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/UniquePtr.h"
 
 namespace mozilla {
 namespace dom {
@@ -66,10 +67,34 @@ public:
   RemoveFollower(Follower* aFollower);
 
 private:
+  class CompositeFollower final : public Follower
+  {
+  public:
+    CompositeFollower(AbortSignal* aComposite, AbortSignal* aSource)
+      : mComposite(aComposite)
+    {
+      Follow(aSource);
+    }
+
+    void Aborted() override
+    {
+      if (mComposite) {
+        mComposite->Abort();
+      }
+    }
+
+  private:
+    // Non-owning: mComposite owns this CompositeFollower via mCompositeFollowers.
+    AbortSignal* mComposite;
+  };
+
   ~AbortSignal() = default;
 
   // Raw pointers. Follower unregisters itself in the DTOR.
   nsTArray<Follower*> mFollowers;
+
+  // Source signal followers for AbortSignal.any() composite signals.
+  nsTArray<UniquePtr<CompositeFollower>> mCompositeFollowers;
 
   bool mAborted;
 };
