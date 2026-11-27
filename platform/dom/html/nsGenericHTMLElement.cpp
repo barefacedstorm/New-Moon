@@ -3106,3 +3106,98 @@ nsGenericHTMLElement::SetInnerText(const nsAString& aValue)
 
   mb.NodesAdded();
 }
+
+static nsTArray<const mozilla::dom::Element*>&
+OpenPopoversList()
+{
+  static nsTArray<const mozilla::dom::Element*> sOpenPopovers;
+  return sOpenPopovers;
+}
+
+static nsIAtom*
+PopoverAtom()
+{
+  static nsCOMPtr<nsIAtom> sAtom = NS_Atomize("popover");
+  return sAtom;
+}
+
+bool
+nsGenericHTMLElement::IsPopoverOpen(const mozilla::dom::Element* aElement)
+{
+  return aElement && OpenPopoversList().Contains(aElement);
+}
+
+void
+nsGenericHTMLElement::GetPopover(nsAString& aValue) const
+{
+  nsAutoString raw;
+  if (!GetAttr(kNameSpaceID_None, PopoverAtom(), raw)) {
+    aValue.SetIsVoid(true);
+    return;
+  }
+  if (raw.IsEmpty() || raw.LowerCaseEqualsLiteral("auto")) {
+    aValue.AssignLiteral("auto");
+  } else if (raw.LowerCaseEqualsLiteral("manual")) {
+    aValue.AssignLiteral("manual");
+  } else {
+    aValue.AssignLiteral("manual");
+  }
+}
+
+void
+nsGenericHTMLElement::SetPopover(const nsAString& aValue, mozilla::ErrorResult& aRv)
+{
+  if (aValue.IsVoid()) {
+    UnsetAttr(kNameSpaceID_None, PopoverAtom(), true);
+    OpenPopoversList().RemoveElement(this);
+  } else {
+    SetAttr(kNameSpaceID_None, PopoverAtom(), aValue, true);
+  }
+}
+
+void
+nsGenericHTMLElement::ShowPopover(mozilla::ErrorResult& aRv)
+{
+  nsAutoString val;
+  GetPopover(val);
+  if (val.IsVoid()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+  auto& list = OpenPopoversList();
+  if (!list.Contains(this)) {
+    list.AppendElement(this);
+  }
+}
+
+void
+nsGenericHTMLElement::HidePopover(mozilla::ErrorResult& aRv)
+{
+  nsAutoString val;
+  GetPopover(val);
+  if (val.IsVoid()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+  OpenPopoversList().RemoveElement(this);
+}
+
+bool
+nsGenericHTMLElement::TogglePopover(const mozilla::dom::Optional<bool>& aForce,
+                                    mozilla::ErrorResult& aRv)
+{
+  nsAutoString val;
+  GetPopover(val);
+  if (val.IsVoid()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return false;
+  }
+  bool currentlyOpen = IsPopoverOpen(this);
+  bool wantOpen = aForce.WasPassed() ? aForce.Value() : !currentlyOpen;
+  if (wantOpen) {
+    ShowPopover(aRv);
+  } else {
+    HidePopover(aRv);
+  }
+  return IsPopoverOpen(this);
+}

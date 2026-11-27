@@ -9,8 +9,10 @@
 interface AbortSignal : EventTarget {
   [NewObject] static AbortSignal abort();
   [NewObject] static AbortSignal timeout(unsigned long long milliseconds);
+  [NewObject] static AbortSignal _any(sequence<AbortSignal> signals);
   
   readonly attribute boolean aborted;
+  [Throws] void throwIfAborted();
 
   attribute EventHandler onabort;
 };

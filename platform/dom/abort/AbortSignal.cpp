@@ -58,6 +58,29 @@ already_AddRefed<AbortSignal> AbortSignal::Timeout(GlobalObject& aGlobal, uint64
   return abortSignal.forget();
 }
 
+already_AddRefed<AbortSignal>
+AbortSignal::Any(GlobalObject& aGlobal,
+                 const Sequence<OwningNonNull<AbortSignal>>& aSignals)
+{
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  for (uint32_t i = 0; i < aSignals.Length(); ++i) {
+    if (aSignals[i]->Aborted()) {
+      RefPtr<AbortSignal> aborted = new AbortSignal(global, true);
+      return aborted.forget();
+    }
+  }
+  RefPtr<AbortSignal> composite = new AbortSignal(global, false);
+  return composite.forget();
+}
+
+void
+AbortSignal::ThrowIfAborted(ErrorResult& aRv) const
+{
+  if (mAborted) {
+    aRv.Throw(NS_ERROR_DOM_ABORT_ERR);
+  }
+}
+
 bool
 AbortSignal::Aborted() const
 {

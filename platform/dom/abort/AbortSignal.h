@@ -55,6 +55,9 @@ public:
 
   static already_AddRefed<AbortSignal> Abort(GlobalObject& aGlobal);
   static already_AddRefed<AbortSignal> Timeout(GlobalObject& aGlobal, uint64_t aMilliseconds);
+  static already_AddRefed<AbortSignal> Any(GlobalObject& aGlobal,
+                                           const Sequence<OwningNonNull<AbortSignal>>& aSignals);
+  void ThrowIfAborted(ErrorResult& aRv) const;
 
   void
   AddFollower(Follower* aFollower);

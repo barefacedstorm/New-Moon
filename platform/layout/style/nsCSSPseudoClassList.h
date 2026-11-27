@@ -102,6 +102,7 @@ CSS_PSEUDO_CLASS(part, ":part", 0, "dom.webcomponents.enabled")
 
 // Match nodes that are HTML but not XHTML
 CSS_PSEUDO_CLASS(defined, ":defined", 0, "")
+CSS_PSEUDO_CLASS(popoverOpen, ":popover-open", 0, "")
 CSS_PSEUDO_CLASS(mozIsHTML, ":-moz-is-html", 0, "")
 
 // Matches nodes that are in a native-anonymous subtree (i.e., nodes in

@@ -72,6 +72,14 @@ partial interface HTMLElement {
            attribute boolean scrollgrab;
 };
 
+// HTML Popover API
+partial interface HTMLElement {
+  [SetterThrows] attribute DOMString? popover;
+  [Throws] void showPopover();
+  [Throws] void hidePopover();
+  [Throws] boolean togglePopover(optional boolean force);
+};
+
 interface mixin TouchEventHandlers {
   [Func="nsGenericHTMLElement::TouchEventsEnabled"]
            attribute EventHandler ontouchstart;

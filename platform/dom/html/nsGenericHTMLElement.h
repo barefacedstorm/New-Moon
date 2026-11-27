@@ -190,6 +190,14 @@ public:
     }
   }
 
+  // HTML Popover API
+  void GetPopover(nsAString& aValue) const;
+  void SetPopover(const nsAString& aValue, mozilla::ErrorResult& aRv);
+  void ShowPopover(mozilla::ErrorResult& aRv);
+  void HidePopover(mozilla::ErrorResult& aRv);
+  bool TogglePopover(const mozilla::dom::Optional<bool>& aForce, mozilla::ErrorResult& aRv);
+  static bool IsPopoverOpen(const mozilla::dom::Element* aElement);
+
   void GetInnerText(mozilla::dom::DOMString& aValue, mozilla::ErrorResult& aError);
   void SetInnerText(const nsAString& aValue);
 

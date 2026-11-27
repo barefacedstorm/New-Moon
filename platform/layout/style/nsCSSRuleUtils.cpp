@@ -7,6 +7,7 @@
 
 #include "mozilla/dom/CustomElementRegistry.h"
 #include "mozilla/dom/Element.h"
+#include "nsGenericHTMLElement.h"
 #include "mozilla/dom/HTMLSlotElement.h"
 #include "mozilla/dom/ShadowRoot.h"
 #include "nsIMozBrowserFrame.h"
@@ -1157,6 +1158,14 @@ nsCSSRuleUtils::SelectorMatches(Element* aElement,
         case CSSPseudoClassType::defined: {
           CustomElementData* ceData = aElement->GetCustomElementData();
           if (ceData && ceData->mState != CustomElementData::State::eCustom) {
+            return false;
+          }
+          break;
+        }
+
+        case CSSPseudoClassType::popoverOpen: {
+          if (!aElement->IsHTMLElement() ||
+              !nsGenericHTMLElement::IsPopoverOpen(aElement)) {
             return false;
           }
           break;
