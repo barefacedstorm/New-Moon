@@ -71,14 +71,13 @@ js::EnsureHelperThreadsInitialized()
 static size_t
 ThreadCountForCPUCount(size_t cpuCount)
 {
-    // Create additional threads on top of the number of cores available, to
-    // provide some excess capacity in case threads pause each other and for mixed
-    // helper-thread workloads.
-    // Note that cpuCount here is the number of logical processors and threadCount
-    // calculated here just adds some extra capacity on top. Use threadCount
-    // with care as it may end up deadlocking.
-    static const uint32_t EXCESS_THREADS = 4;
-    return cpuCount + EXCESS_THREADS;
+    // Cap helper threads so high-core CPUs don't spawn dozens of idle JS Helper
+    // threads (32+ threads on 28-core CPUs) while preserving full parallelism on
+    // older 2-8 core hardware.
+    static const size_t MAX_EFFECTIVE_CPUS = 8;
+    static const uint32_t EXCESS_THREADS = 2;
+    size_t capped = cpuCount > MAX_EFFECTIVE_CPUS ? MAX_EFFECTIVE_CPUS : cpuCount;
+    return capped + EXCESS_THREADS;
 }
 
 void

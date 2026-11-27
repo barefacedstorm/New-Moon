@@ -667,6 +667,14 @@ GPUDevice::CreateTexture(JSContext* aCx, JS::Handle<JS::Value> aDesc, ErrorResul
   if (GetPropString(aCx, obj, "format", fmtStr)) {
     desc.format = ParseTextureFormat(fmtStr);
   }
+  if (desc.format == WGPUTextureFormat_Undefined) {
+    aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+    return nullptr;
+  }
+  if (desc.size.width == 0 || desc.size.height == 0 || desc.size.depthOrArrayLayers == 0) {
+    aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+    return nullptr;
+  }
   uint32_t usage = 0;
   GetPropU32(aCx, obj, "usage", usage);
   desc.usage = static_cast<WGPUTextureUsage>(usage);
@@ -779,6 +787,10 @@ GPUDevice::CreateBindGroupLayout(JSContext* aCx, JS::Handle<JS::Value> aDesc, Er
           e.storageTexture.viewDimension = WGPUTextureViewDimension_2D;
           if (GetPropString(aCx, sub, "access", s)) e.storageTexture.access = ParseStorageTextureAccess(s);
           if (GetPropString(aCx, sub, "format", s)) e.storageTexture.format = ParseTextureFormat(s);
+          if (e.storageTexture.format == WGPUTextureFormat_Undefined) {
+            aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+            return nullptr;
+          }
           if (GetPropString(aCx, sub, "viewDimension", s)) e.storageTexture.viewDimension = ParseTextureViewDimension(s);
         }
         entries.push_back(e);
@@ -1029,6 +1041,10 @@ GPUDevice::CreateRenderPipeline(JSContext* aCx, JS::Handle<JS::Value> aDesc, Err
                 JS::Rooted<JSObject*> ao(aCx, &av.toObject());
                 WGPUVertexAttribute attr = WGPU_VERTEX_ATTRIBUTE_INIT;
                 if (GetPropString(aCx, ao, "format", s)) attr.format = ParseVertexFormat(s);
+                if (static_cast<uint32_t>(attr.format) == 0) {
+                  aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+                  return nullptr;
+                }
                 GetPropU64(aCx, ao, "offset", attr.offset);
                 GetPropU32(aCx, ao, "shaderLocation", attr.shaderLocation);
                 vAttrsStorage[i].push_back(attr);
@@ -1058,6 +1074,10 @@ GPUDevice::CreateRenderPipeline(JSContext* aCx, JS::Handle<JS::Value> aDesc, Err
   JS::Rooted<JSObject*> dsObj(aCx);
   if (GetPropObj(aCx, obj, "depthStencil", &dsObj)) {
     if (GetPropString(aCx, dsObj, "format", s)) ds.format = ParseTextureFormat(s);
+    if (ds.format == WGPUTextureFormat_Undefined) {
+      aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+      return nullptr;
+    }
     bool dwe = false;
     if (GetPropBool(aCx, dsObj, "depthWriteEnabled", dwe)) {
       ds.depthWriteEnabled = dwe ? WGPUOptionalBool_True : WGPUOptionalBool_False;
@@ -1119,6 +1139,10 @@ GPUDevice::CreateRenderPipeline(JSContext* aCx, JS::Handle<JS::Value> aDesc, Err
           if (!JS_GetElement(aCx, tObj, i, &tv) || !tv.isObject()) continue;
           JS::Rooted<JSObject*> to(aCx, &tv.toObject());
           if (GetPropString(aCx, to, "format", s)) targets[i].format = ParseTextureFormat(s);
+          if (targets[i].format == WGPUTextureFormat_Undefined) {
+            aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+            return nullptr;
+          }
           uint32_t wm = WGPUColorWriteMask_All;
           if (GetPropU32(aCx, to, "writeMask", wm)) targets[i].writeMask = static_cast<WGPUColorWriteMask>(wm);
           JS::Rooted<JSObject*> blendObj(aCx);
@@ -1812,7 +1836,13 @@ GPUTexture::CreateView(JSContext* aCx, JS::Handle<JS::Value> aDesc, ErrorResult&
   if (aDesc.isObject()) {
     JS::Rooted<JSObject*> obj(aCx, &aDesc.toObject());
     if (GetPropString(aCx, obj, "label", label)) desc.label = ToWGPUString(label);
-    if (GetPropString(aCx, obj, "format", s)) desc.format = ParseTextureFormat(s);
+    if (GetPropString(aCx, obj, "format", s)) {
+      desc.format = ParseTextureFormat(s);
+      if (desc.format == WGPUTextureFormat_Undefined) {
+        aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+        return nullptr;
+      }
+    }
     if (GetPropString(aCx, obj, "dimension", s)) desc.dimension = ParseTextureViewDimension(s);
     if (GetPropString(aCx, obj, "aspect", s)) desc.aspect = ParseTextureAspect(s);
     GetPropU32(aCx, obj, "baseMipLevel", desc.baseMipLevel);

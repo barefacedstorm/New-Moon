@@ -1300,6 +1300,15 @@ pref("javascript.options.mem.gc_max_empty_chunk_count", 6);
 pref("javascript.options.mem.gc_high_frequency_high_limit_mb", 256);
 pref("javascript.options.mem.gc_high_frequency_heap_growth_max", 200);
 
-// Background tab CPU throttling
+// Background tab CPU throttling & runaway resource caps
 pref("dom.min_background_timeout_value", 1000);
 pref("dom.timeout.throttling_delay", 10000);
+pref("dom.workers.maxPerDomain", 16);                  // prevent runaway tabs leaking dozens of worker JS runtimes (default 512)
+pref("image.multithreaded_decoding.limit", 2);         // cap image decoder threads for low CPU/RAM overhead
+pref("media.cache_size", 65536);                       // 64 MiB media cache cap (down from 512 MiB)
+pref("media.suspend-bkgnd-video.enabled", true);
+pref("media.suspend-bkgnd-video.delay-ms", 3000);      // suspend background video decode after 3s
+pref("browser.pagethumbnails.capturing_disabled", true); // avoid background screenshot CPU/GPU/RAM churn
+pref("browser.sessionstore.max_tabs_undo", 5);
+pref("browser.cache.disk.capacity", 131072);           // 128 MiB disk cache cap
+pref("memory.ghost_window_timeout_seconds", 30);       // faster ghost-window reclamation
