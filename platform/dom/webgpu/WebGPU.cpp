@@ -211,7 +211,14 @@ GPU::GPU(nsIGlobalObject* aGlobal)
   : mOwner(aGlobal)
   , mInstance(nullptr)
 {
+  // Restrict to primary backends (Vulkan/DX12/Metal) and exclude GLES/EGL.
+  // Probing wgpu-hal's EGL backend from the browser main thread panics with
+  // EGL_BAD_ACCESS when a GL/WebGL context is already active.
+  WGPUInstanceExtras extras = {};
+  extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
+  extras.backends = WGPUInstanceBackend_Primary;
   WGPUInstanceDescriptor desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
+  desc.nextInChain = &extras.chain;
   mInstance = wgpuCreateInstance(&desc);
 }
 
