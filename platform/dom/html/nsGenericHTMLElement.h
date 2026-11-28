@@ -1523,8 +1523,8 @@ protected:
 
 /**
  * A macro to implement getter and setter for action and form action content
- * attributes. It's very similar to NS_IMPL_URI_ATTR excepted that if the
- * content attribute is the empty string, the empty string is returned.
+ * attributes. Per the HTML Living Standard, when the content attribute is
+ * missing or the empty string, the element's node document's URL is returned.
  */
 #define NS_IMPL_ACTION_ATTR(_class, _method, _atom)                 \
   NS_IMETHODIMP                                                     \
@@ -1532,7 +1532,18 @@ protected:
   {                                                                 \
     GetAttr(kNameSpaceID_None, nsGkAtoms::_atom, aValue);           \
     if (!aValue.IsEmpty()) {                                        \
-      GetURIAttr(nsGkAtoms::_atom, nullptr, aValue);                 \
+      GetURIAttr(nsGkAtoms::_atom, nullptr, aValue);                \
+    } else {                                                        \
+      nsIDocument* doc = OwnerDoc();                                \
+      if (doc) {                                                    \
+        nsIURI* docURI = doc->GetDocumentURI();                     \
+        if (docURI) {                                               \
+          nsAutoCString spec;                                       \
+          if (NS_SUCCEEDED(docURI->GetSpec(spec))) {                \
+            CopyUTF8toUTF16(spec, aValue);                          \
+          }                                                         \
+        }                                                           \
+      }                                                             \
     }                                                               \
     return NS_OK;                                                   \
   }                                                                 \
