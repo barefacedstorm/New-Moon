@@ -947,9 +947,6 @@ RetrievalContext::Wait()
 
         int cnumber = ConnectionNumber(xDisplay);
         fd_set select_set;
-        FD_ZERO(&select_set);
-        FD_SET(cnumber, &select_set);
-        ++cnumber;
         TimeStamp start = TimeStamp::Now();
 
         do {
@@ -971,11 +968,17 @@ RetrievalContext::Wait()
             }
 
             TimeStamp now = TimeStamp::Now();
+            int64_t remaining =
+                kClipboardTimeout - static_cast<int64_t>((now - start).ToMicroseconds());
+            if (remaining <= 0) {
+                break;
+            }
             struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = std::max<int32_t>(0,
-                kClipboardTimeout - (now - start).ToMicroseconds());
-            select_result = select(cnumber, &select_set, nullptr, nullptr, &tv);
+            tv.tv_sec = remaining / 1000000;
+            tv.tv_usec = remaining % 1000000;
+            FD_ZERO(&select_set);
+            FD_SET(cnumber, &select_set);
+            select_result = select(cnumber + 1, &select_set, nullptr, nullptr, &tv);
         } while (select_result == 1 ||
                  (select_result == -1 && errno == EINTR));
     }
