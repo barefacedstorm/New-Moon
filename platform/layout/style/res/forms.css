@@ -567,10 +567,8 @@ input[type="checkbox"] {
   cursor: default;
   padding: 0;
   -moz-binding: none;
-  /* same colors as |input| rule. */
-  background-color: -moz-Field;
-  color: -moz-FieldText;
-  border: 2px inset ThreeDLightShadow;
+  background-color: initial;
+  border: initial;
 }
 
 input[type="radio"]:disabled,
@@ -581,11 +579,7 @@ input[type="checkbox"]:disabled,
 input[type="checkbox"]:disabled:active,
 input[type="checkbox"]:disabled:hover,
 input[type="checkbox"]:disabled:hover:active {
-  padding: 1px;
-  border: 1px inset ThreeDShadow;
-  /* same as above */
   color: GrayText;
-  background-color: ThreeDFace;
   cursor: inherit;
 }
 
@@ -598,12 +592,6 @@ input[type="radio"]:-moz-focusring {
   outline: 1px dotted;
 }
 %endif
-
-input[type="checkbox"]:hover:active,
-input[type="radio"]:hover:active {
-  background-color: ThreeDFace;
-  border-style: inset;
-}
 
 input[type="search"] {
   box-sizing: border-box;

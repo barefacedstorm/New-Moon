@@ -115,8 +115,8 @@ nsGfxCheckboxControlFrame::BuildDisplayList(nsDisplayListBuilder*   aBuilder,
   if ((!IsChecked() && !IsIndeterminate()) || !IsVisibleForPainting(aBuilder))
     return;   // we're not checked or not visible, nothing to paint.
     
-  if (IsThemed())
-    return; // No need to paint the checkmark. The theme will do it.
+  if (IsThemed() || StyleDisplay()->mAppearance == NS_THEME_NONE)
+    return; // No need to paint the checkmark. The theme or author CSS will do it.
 
   aLists.Content()->AppendNewToTop(new (aBuilder)
     nsDisplayGeneric(aBuilder, this,
